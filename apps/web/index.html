@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#1b1b1f" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="icon" href="icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+    <title>Imagine Studio · Phase 0</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #1b1b1f;
+        --fg: #e8e8ec;
+        --dim: #9a9aa6;
+        --panel: rgba(28, 28, 34, 0.86);
+        --line: rgba(255, 255, 255, 0.12);
+        --accent: #6ea8ff;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--fg);
+        font: 13px/1.4 -apple-system, "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
+        overflow: hidden;
+        overscroll-behavior: none;
+        -webkit-user-select: none;
+        user-select: none;
+        -webkit-touch-callout: none;
+      }
+      #canvas {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        touch-action: none;
+        display: block;
+      }
+      #hud {
+        position: fixed;
+        top: env(safe-area-inset-top, 0);
+        right: 8px;
+        padding: 6px 10px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        font-family: ui-monospace, Menlo, monospace;
+        font-size: 11px;
+        white-space: pre;
+        pointer-events: none;
+        color: var(--dim);
+        backdrop-filter: blur(6px);
+      }
+      #bar {
+        position: fixed;
+        left: 8px;
+        bottom: calc(env(safe-area-inset-bottom, 0) + 8px);
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 10px;
+        align-items: center;
+        padding: 8px 10px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        max-width: calc(100vw - 16px);
+        backdrop-filter: blur(6px);
+      }
+      #bar label {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        color: var(--dim);
+      }
+      #bar input[type="range"] {
+        width: 90px;
+      }
+      #bar button {
+        min-height: 36px;
+        padding: 0 12px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--fg);
+        font: inherit;
+      }
+      #bar button:active {
+        background: rgba(255, 255, 255, 0.16);
+      }
+      #bar input[type="color"] {
+        width: 36px;
+        height: 36px;
+        padding: 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: none;
+      }
+      #err {
+        position: fixed;
+        left: 8px;
+        top: 8px;
+        padding: 8px 10px;
+        background: #4a1f1f;
+        border-radius: 8px;
+        display: none;
+        white-space: pre-wrap;
+        max-width: 80vw;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+    <div id="hud">起動中…</div>
+    <div id="err"></div>
+    <div id="bar">
+      <label>半径 <input id="radius" type="range" min="0.5" max="64" step="0.5" value="6" /><span id="radiusV">6</span></label>
+      <label>手ブレ <input id="stab" type="range" min="0" max="40" step="1" value="8" /><span id="stabV">8</span></label>
+      <label>硬さ <input id="hard" type="range" min="0" max="1" step="0.05" value="0.7" /><span id="hardV">0.7</span></label>
+      <label>不透明 <input id="opacity" type="range" min="0.05" max="1" step="0.05" value="1" /><span id="opacityV">1</span></label>
+      <label><input id="predict" type="checkbox" checked /> 予測</label>
+      <label><input id="finger" type="checkbox" /> 指で描く</label>
+      <input id="color" type="color" value="#1a1a1a" />
+      <button id="undo">戻す</button>
+      <button id="clear">消去</button>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

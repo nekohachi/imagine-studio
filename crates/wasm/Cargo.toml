@@ -1,0 +1,13 @@
+[package]
+name = "imagine-wasm"
+version = "0.1.0"
+edition.workspace = true
+description = "brush-core などの Rust コアを JS から使うための wasm-bindgen 結合"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+brush-core = { path = "../brush-core" }
+wasm-bindgen = "=0.2.100"
+js-sys = "0.3.77"

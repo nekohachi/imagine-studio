@@ -23,6 +23,8 @@
 
 ## 計測(09 の表を埋める)
 
+メモリの 2 行はタイル化(フェーズ 1)の後でないと測れない。それ以外はフェーズ 0 の検証アプリ(`https://nekohachi.github.io/imagine-studio/`)の HUD で読む。
+
 | 項目 | MovinkPad | iPad mini |
 |---|---|---|
 | ペン先から画面までの遅延(ms) | | |

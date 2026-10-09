@@ -1,0 +1,7 @@
+[package]
+name = "brush-core"
+version = "0.1.0"
+edition.workspace = true
+description = "GPU非依存のブラシエンジンコア: 入力補間・手ぶれ補正・筆圧カーブ・スタンプ生成"
+
+[dependencies]

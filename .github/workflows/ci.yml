@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.100
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Rust のテスト
+        run: cargo test --workspace
+
+      - name: wasm を組む
+        run: sh scripts/build-wasm.sh
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 型検査
+        run: pnpm typecheck
+      - name: テスト
+        run: pnpm test
+      - name: ビルド
+        run: pnpm build
+
+      - name: ブラウザを入れる
+        run: pnpm exec playwright install --with-deps chromium
+      - name: 実際の Chromium で描いて確かめる
+        run: pnpm smoke
+      - name: 画面の写真を残す
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-screenshot
+          path: smoke.png
+          if-no-files-found: ignore

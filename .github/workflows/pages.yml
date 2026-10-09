@@ -1,0 +1,66 @@
+name: Deploy to GitHub Pages
+
+# Pages の Source を「GitHub Actions」にしてあることが前提。
+# 最初の 1 回だけ Settings → Pages → Source で「GitHub Actions」を選ぶ必要がある
+# (サイトの新規作成は GITHUB_TOKEN ではできない)。
+# 公開先: https://nekohachi.github.io/imagine-studio/
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.100
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - run: sh scripts/build-wasm.sh
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - name: サブパス用にビルド
+        env:
+          IMAGINE_BASE: /${{ github.event.repository.name }}/
+        run: pnpm build
+      - name: Jekyll に通さない
+        run: touch apps/web/dist/.nojekyll
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: apps/web/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

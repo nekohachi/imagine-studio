@@ -1,0 +1,19 @@
+{
+  "name": "imagine-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Imagine Studio: 長押しの輪で操作するお絵描き・漫画・アニメ PWA",
+  "packageManager": "pnpm@10.28.0",
+  "scripts": {
+    "wasm": "sh scripts/build-wasm.sh",
+    "dev": "pnpm --filter @imagine/web dev",
+    "build": "pnpm --filter @imagine/web build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
+  }
+}
