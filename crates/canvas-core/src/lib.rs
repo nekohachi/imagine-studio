@@ -16,10 +16,12 @@ pub mod history;
 pub mod io;
 pub mod selection;
 pub mod tile;
+pub mod transform;
 
 pub use blend::{composite_pixel, BlendMode};
 pub use cel::{Blend, Cel};
 pub use document::{Document, Layer, LayerId};
 pub use history::{Entry, History};
 pub use selection::{region_by_color, Mask, SelectMode};
+pub use transform::{resample, Affine, Floating};
 pub use tile::{PixelFormat, Rect, Tile, TileKey, TILE};

@@ -45,7 +45,7 @@ export function saveSettings(s: Settings): void {
   }
 }
 
-export type StateEvent = "brush" | "color" | "layers" | "view" | "doc" | "stats" | "settings" | "tool";
+export type StateEvent = "brush" | "color" | "layers" | "view" | "doc" | "stats" | "settings" | "tool" | "transform";
 
 export class AppState {
   settings = loadSettings();
@@ -69,7 +69,9 @@ export class AppState {
   eyedropOnce = false;
   uiHidden = false;
   /** 今のツール。brush 以外はキャンバスのタップが描画にならない */
-  tool: "brush" | "select" | "fill" = "brush";
+  tool: "brush" | "select" | "fill" | "transform" = "brush";
+  /** 変形中: 持ち上げた矩形(doc)と、今の行列 [a, b, c, d, e, f] */
+  transform: { rect: [number, number, number, number]; m: [number, number, number, number, number, number] } | null = null;
   selectTool: "rect" | "lasso" | "wand" = "rect";
   /** 自動選択と塗りの許容値 0..255 */
   tolerance = 32;

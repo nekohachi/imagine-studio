@@ -16,10 +16,14 @@ import {
   type RadialMenu,
 } from "@imagine/ring";
 import type { Bridge } from "./bridge";
+import { about, apply, inverse, mul, rotate, scale, translate, type Affine } from "./affine";
 import { PalmGuard, PointPacker, SpeedPressure, normalizePressure } from "./input";
 import { POINT_STRIDE } from "./protocol";
 import type { AppState } from "./state";
-import { TwoFingerGesture, fitView, screenToDoc, zoomAt } from "./view";
+import { TwoFingerGesture, docToScreen, fitView, screenToDoc, zoomAt } from "./view";
+
+/** 変形の隅つまみの大きさ(CSS px、当たりはこの 1.8 倍) */
+const HANDLE_PX = 12;
 
 export interface CanvasInputHooks {
   /** 1 本の長押し。画面座標(CSS px) */
@@ -68,6 +72,21 @@ export class CanvasInput {
   private lineEnd: { x: number; y: number } | null = null;
   /** 選択のドラッグ(矩形 / 投げ縄)。点は doc 座標 */
   private selecting: { kind: "rect" | "lasso"; pts: number[]; screen: number[]; id: number } | null = null;
+  /** 変形のドラッグ: 移動、または隅をつまんだ拡縮(反対の隅を軸に) */
+  private dragging: {
+    id: number;
+    kind: "move" | "scale";
+    /** ドラッグ開始時の行列 */
+    base: Affine;
+    /** 開始点(doc) */
+    x0: number;
+    y0: number;
+    /** 拡縮の軸(doc、変形後の座標) */
+    px: number;
+    py: number;
+  } | null = null;
+  /** 2 本指での拡縮・回転の開始時の行列 */
+  private gestureBase: Affine | null = null;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -170,6 +189,71 @@ export class CanvasInput {
     this.bridge.send({ type: "cancel" });
   }
 
+  // ---- 変形 ----
+
+  /** 変形中の矩形の 4 隅(doc、変形後)。 */
+  private transformCorners(): Array<[number, number]> | null {
+    const t = this.state.transform;
+    if (!t) return null;
+    const [x, y, w, h] = t.rect;
+    return [apply(t.m, x, y), apply(t.m, x + w, y), apply(t.m, x + w, y + h), apply(t.m, x, y + h)];
+  }
+
+  /** doc → 画面(CSS px)。 */
+  private toCss(x: number, y: number): [number, number] {
+    const [sx, sy] = docToScreen(this.state.view, x, y);
+    const r = this.canvas.getBoundingClientRect();
+    return [sx / this.dpr + r.left, sy / this.dpr + r.top];
+  }
+
+  /** 変形の枠とつまみを SVG に描く。view や行列が変わるたびに呼ぶ。 */
+  refreshOverlay(): void {
+    if (this.selecting) return;
+    const corners = this.transformCorners();
+    const ov = this.hooks.overlay;
+    if (!corners) {
+      ov.innerHTML = "";
+      return;
+    }
+    const css = corners.map(([x, y]) => this.toCss(x, y));
+    const d = css.map(([x, y], i) => `${i === 0 ? "M" : "L"}${x},${y}`).join(" ") + " Z";
+    const hs = HANDLE_PX;
+    const handles = css
+      .map(([x, y]) => `<rect class="handle" x="${x - hs / 2}" y="${y - hs / 2}" width="${hs}" height="${hs}"/>`)
+      .join("");
+    ov.innerHTML = `<path class="tbox" d="${d}"/>${handles}`;
+  }
+
+  /** つまみの上なら、その添字(0..3)。 */
+  private hitHandle(e: { clientX: number; clientY: number }): number {
+    const corners = this.transformCorners();
+    if (!corners) return -1;
+    const r = HANDLE_PX * 0.9 * 1.8;
+    for (let i = 0; i < 4; i++) {
+      const [x, y] = this.toCss(corners[i]![0], corners[i]![1]);
+      if (Math.abs(e.clientX - x) <= r && Math.abs(e.clientY - y) <= r) return i;
+    }
+    return -1;
+  }
+
+  private setTransform(m: Affine): void {
+    const t = this.state.transform;
+    if (!t) return;
+    t.m = m;
+    this.bridge.send({ type: "transformPreview", m });
+    this.refreshOverlay();
+    this.state.emit("transform");
+  }
+
+  /** 変形を外から動かす(反転、回転 90°)。中心を軸に。 */
+  applyToTransform(delta: Affine): void {
+    const t = this.state.transform;
+    if (!t) return;
+    const [x, y, w, h] = t.rect;
+    const [cx, cy] = apply(t.m, x + w / 2, y + h / 2);
+    this.setTransform(mul(about(cx, cy, delta), t.m));
+  }
+
   /** 選択のドラッグ中の仮表示(画面座標)。 */
   private drawOverlay(): void {
     const ov = this.hooks.overlay;
@@ -247,6 +331,9 @@ export class CanvasInput {
           this.longPress.cancel();
           const [a, b] = Array.from(this.touches.values()) as [[number, number], [number, number]];
           this.gesture.start(this.state.view, a[0], a[1], b[0], b[1]);
+          // 変形中の 2 本指は、ビューではなく持ち上げた画素を拡縮・回転する
+          this.gestureBase = this.state.tool === "transform" && this.state.transform ? this.state.transform.m : null;
+          if (this.dragging) this.dragging = null;
           const r = this.canvas.getBoundingClientRect();
           this.viewLongPress.begin(e.pointerId, (a[0] + b[0]) / 2 / this.dpr + r.left, (a[1] + b[1]) / 2 / this.dpr + r.top);
           this.ensureLoop();
@@ -275,6 +362,22 @@ export class CanvasInput {
         this.state.eyedropOnce = false;
         const [x, y] = this.toDoc(e);
         this.hooks.onEyedrop(x, y);
+        return;
+      }
+
+      // 変形: 隅をつまめば拡縮、それ以外は移動
+      if (this.state.tool === "transform" && this.state.transform) {
+        const t = this.state.transform;
+        const [x, y] = this.toDoc(e);
+        const hi = this.hitHandle(e);
+        if (hi >= 0) {
+          const corners = this.transformCorners()!;
+          const opp = corners[(hi + 2) % 4]!;
+          this.dragging = { id: e.pointerId, kind: "scale", base: t.m, x0: x, y0: y, px: opp[0], py: opp[1] };
+        } else {
+          this.dragging = { id: e.pointerId, kind: "move", base: t.m, x0: x, y0: y, px: 0, py: 0 };
+        }
+        c.setPointerCapture(e.pointerId);
         return;
       }
 
@@ -368,6 +471,28 @@ export class CanvasInput {
     }
 
     c.addEventListener("pointermove", (e) => {
+      if (this.dragging && e.pointerId === this.dragging.id) {
+        const d = this.dragging;
+        const [x, y] = this.toDoc(e);
+        if (d.kind === "move") {
+          this.setTransform(mul(translate(x - d.x0, y - d.y0), d.base));
+        } else {
+          // 反対の隅を軸に、距離の比で拡縮(CTL で縦横比を崩す)
+          const d0 = Math.hypot(d.x0 - d.px, d.y0 - d.py);
+          const d1 = Math.hypot(x - d.px, y - d.py);
+          const k = d0 > 1 ? d1 / d0 : 1;
+          let delta: Affine;
+          if (this.mods.on("ctrl")) {
+            const kx = Math.abs(d.x0 - d.px) > 1 ? (x - d.px) / (d.x0 - d.px) : 1;
+            const ky = Math.abs(d.y0 - d.py) > 1 ? (y - d.py) / (d.y0 - d.py) : 1;
+            delta = scale(kx, ky);
+          } else {
+            delta = scale(k, k);
+          }
+          this.setTransform(mul(about(d.px, d.py, delta), d.base));
+        }
+        return;
+      }
       if (this.selecting && e.pointerId === this.selecting.id) {
         const [x, y] = this.toDoc(e);
         if (this.selecting.kind === "rect") {
@@ -389,9 +514,20 @@ export class CanvasInput {
             const v = this.gesture.update(a[0], a[1], b[0], b[1]);
             if (v) {
               this.viewLongPress.cancel();
-              this.state.view = v;
-              this.viewDirty = true;
-              this.ensureLoop();
+              if (this.gestureBase) {
+                // 画面の相似変換(v = D · view0)を doc の変換に直して、持ち上げた画素へ掛ける
+                const base = this.state.view;
+                const k = v.scale / base.scale;
+                const th = v.rot - base.rot;
+                // view0 の原点が v でどこへ行くか = doc 原点の移動
+                const [ox, oy] = screenToDoc(base, v.tx, v.ty);
+                const delta: Affine = mul(translate(ox, oy), mul(rotate(th), scale(k, k)));
+                this.setTransform(mul(delta, this.gestureBase));
+              } else {
+                this.state.view = v;
+                this.viewDirty = true;
+                this.ensureLoop();
+              }
             }
             return;
           }
@@ -418,6 +554,15 @@ export class CanvasInput {
 
     const finish = (e: PointerEvent, cancel: boolean) => {
       this.longPress.end(e.pointerId);
+      if (this.dragging && e.pointerId === this.dragging.id) {
+        this.dragging = null;
+        try {
+          c.releasePointerCapture(e.pointerId);
+        } catch {
+          /* 既に外れている */
+        }
+        return;
+      }
       if (this.selecting && e.pointerId === this.selecting.id) {
         if (!cancel) {
           const [x, y] = this.toDoc(e);

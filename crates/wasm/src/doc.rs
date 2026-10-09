@@ -233,6 +233,34 @@ impl Doc {
         js_sys::Int32Array::from(&[b.x, b.y, b.w, b.h][..])
     }
 
+    // ---- 変形 ----
+
+    /// 持ち上げる。戻り値は [x, y, w, h]。何も無ければ長さ 0。
+    pub fn begin_transform(&mut self, layer: u32) -> js_sys::Int32Array {
+        match self.inner.begin_transform(layer) {
+            Some(r) => js_sys::Int32Array::from(&[r.x, r.y, r.w, r.h][..]),
+            None => js_sys::Int32Array::new_with_length(0),
+        }
+    }
+    /// 持ち上げた画素(プリマルチ RGBA8、矩形の並び)。コピー。
+    pub fn floating_pixels(&self) -> js_sys::Uint8Array {
+        match self.inner.floating() {
+            Some(f) => js_sys::Uint8Array::from(f.data.as_slice()),
+            None => js_sys::Uint8Array::new_with_length(0),
+        }
+    }
+    pub fn has_floating(&self) -> bool {
+        self.inner.floating().is_some()
+    }
+    /// 置く。行列は [a, b, c, d, e, f]。戻り値は変わったタイル。
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_transform(&mut self, a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) -> js_sys::Int32Array {
+        keys_to_array(&self.inner.commit_transform(canvas_core::Affine { a, b, c, d, e, f }))
+    }
+    pub fn cancel_transform(&mut self) -> js_sys::Int32Array {
+        keys_to_array(&self.inner.cancel_transform())
+    }
+
     // ---- 塗りつぶし ----
 
     /// バケツ。reference が 0 なら見えている絵で領域を決める。色は 0..255 のストレート RGB。

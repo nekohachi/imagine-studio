@@ -34,6 +34,8 @@ let lastStrokeDabs = 0;
 let lastBakeMs = 0;
 // このストロークで触った矩形(ドキュメント px)
 let bbox: { x0: number; y0: number; x1: number; y1: number } | null = null;
+// 変形中の行列(持ち上げていなければ null)
+let floatM: number[] | null = null;
 
 function post(m: FromWorker, transfer: Transferable[] = []): void {
   (self as unknown as Worker).postMessage(m, transfer);
@@ -152,7 +154,7 @@ function present(showStroke = false, showPredict = false): void {
   const vis = doc ? doc.layer_visible(active) : true;
   const mode = doc ? doc.layer_blend(active) : 0;
   const clip = doc ? doc.layer_clip(active) && doc.clip_base(active) !== 0 : false;
-  renderer?.present(view, brushOpacity(), showStroke, showPredict, op, vis, mode, clip);
+  renderer?.present(view, brushOpacity(), showStroke, showPredict, op, vis, mode, clip, floatM);
 }
 
 // ---- 自動保存(変更から 2 秒後、連続する変更はまとめる) ----
@@ -548,6 +550,57 @@ async function handle(m: ToWorker): Promise<void> {
       uploadActiveTiles(doc.delete_selection(active));
       present();
       scheduleAutosave();
+      post({ type: "stats", stats: stats(performance.now(), 0, 0) });
+      return;
+    }
+    case "transformBegin": {
+      if (!doc || !renderer) return;
+      if (doc.has_floating()) return;
+      const r = doc.begin_transform(active);
+      if (r.length < 4) {
+        post({ type: "floating", rect: null, failed: true });
+        return;
+      }
+      const [x, y, w, h] = [r[0]!, r[1]!, r[2]!, r[3]!];
+      renderer.uploadFloating(x, y, w, h, doc.floating_pixels());
+      floatM = [1, 0, 0, 1, 0, 0];
+      // 持ち上げた分が消えたレイヤーを転送
+      uploadActiveAll();
+      present();
+      post({ type: "floating", rect: [x, y, w, h] });
+      post({ type: "stats", stats: stats(performance.now(), 0, 0) });
+      return;
+    }
+    case "transformPreview": {
+      if (!floatM) return;
+      floatM = m.m.slice(0, 6);
+      present();
+      return;
+    }
+    case "transformCommit": {
+      if (!doc || !renderer || !floatM) return;
+      const t0 = performance.now();
+      const mm = m.m;
+      const changed = doc.commit_transform(mm[0]!, mm[1]!, mm[2]!, mm[3]!, mm[4]!, mm[5]!);
+      floatM = null;
+      renderer.clearFloating();
+      uploadActiveTiles(changed);
+      syncSelection();
+      lastBakeMs = performance.now() - t0;
+      present();
+      scheduleAutosave();
+      post({ type: "floating", rect: null });
+      post({ type: "stats", stats: stats(t0, 0, 0) });
+      return;
+    }
+    case "transformCancel": {
+      if (!doc || !renderer) return;
+      const changed = doc.cancel_transform();
+      floatM = null;
+      renderer.clearFloating();
+      uploadActiveTiles(changed);
+      present();
+      post({ type: "floating", rect: null });
       post({ type: "stats", stats: stats(performance.now(), 0, 0) });
       return;
     }

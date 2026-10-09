@@ -17,6 +17,7 @@ import {
   renderLaterPanel,
   renderLayersPanel,
   renderSelectPanel,
+  renderTransformPanel,
   setThumbnails,
   viewMenu,
   type Ctx,
@@ -167,11 +168,39 @@ const ctx: Ctx = {
     thumbnails: () => requestThumbnails(),
     setTool: (tool) => {
       if (state.tool === tool) return;
+      // 変形から別のツールへ移るときは置いて確定する
+      if (state.tool === "transform" && state.transform) ctx.act.transformCommit();
       state.tool = tool;
       state.emit("tool");
     },
+    transformBegin: () => bridge.send({ type: "transformBegin" }),
+    transformCommit: () => {
+      if (!state.transform) return;
+      bridge.send({ type: "transformCommit", m: state.transform.m });
+      state.transform = null;
+      input.refreshOverlay();
+      if (shell.panelOpen() === "transform") shell.closePanel();
+      state.tool = "brush";
+      state.emit("tool");
+    },
+    transformCancel: () => {
+      bridge.send({ type: "transformCancel" });
+      state.transform = null;
+      input.refreshOverlay();
+      if (shell.panelOpen() === "transform") shell.closePanel();
+      state.tool = "brush";
+      state.emit("tool");
+    },
+    transformDelta: (delta) => input.applyToTransform(delta),
   },
 };
+bridge.on("floating", (m) => {
+  state.transform = m.rect ? { rect: m.rect, m: [1, 0, 0, 1, 0, 0] } : null;
+  input.refreshOverlay();
+  if (shell.panelOpen() === "transform") shell.rerender();
+  if (m.failed) shell.toast("持ち上げるものがありません(選択範囲か、絵のあるレイヤーが要ります)");
+});
+state.on("view", () => input.refreshOverlay());
 state.on("tool", () => {
   shell.buttons.select!.classList.toggle("on", state.tool === "select");
   shell.buttons.brush!.classList.toggle("on", state.tool === "brush" && !state.brush.eraser);
@@ -202,7 +231,7 @@ const input = new CanvasInput(canvas, state, bridge, mods, {
     if (!shell.panelOpen()) return false;
     // 選択と塗りのパネルは開いたまま使う(タップが操作なので)
     const open = shell.panelOpen();
-    if (open === "select" || open === "fill") return false;
+    if (open === "select" || open === "fill" || open === "transform") return false;
     shell.closePanel();
     return true;
   },
@@ -215,7 +244,7 @@ const panels: Record<string, () => void> = {
   actions: () => shell.openPanel("actions", (b) => renderActionsPanel(b, ctx)),
   adjust: () => shell.openPanel("adjust", (b) => renderLaterPanel(b, "調整")),
   select: () => shell.openPanel("select", (b) => renderSelectPanel(b, ctx)),
-  transform: () => shell.openPanel("transform", (b) => renderLaterPanel(b, "変形")),
+  transform: () => shell.openPanel("transform", (b) => renderTransformPanel(b, ctx)),
   fill: () => shell.openPanel("fill", (b) => renderFillPanel(b, ctx)),
   brush: () => {
     ctx.act.setTool("brush");
@@ -432,6 +461,14 @@ window.addEventListener("keydown", (e) => {
     panels.select!();
   } else if (k === "g") {
     panels.fill!();
+  } else if (k === "t") {
+    panels.transform!();
+  } else if (k === "enter" && state.transform) {
+    ctx.act.transformCommit();
+    shell.closePanel();
+  } else if (k === "escape") {
+    if (state.transform) ctx.act.transformCancel();
+    shell.closePanel();
   } else if (k === "b") {
     ctx.act.setTool("brush");
     if (state.brush.eraser) toggleEraser();

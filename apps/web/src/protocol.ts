@@ -90,6 +90,10 @@ export type ToWorker =
   | { type: "fill"; x: number; y: number; tolerance: number; contiguous: boolean; merged: boolean }
   | { type: "fillSelection" }
   | { type: "deleteSelection" }
+  | { type: "transformBegin" }
+  | { type: "transformPreview"; m: number[] }
+  | { type: "transformCommit"; m: number[] }
+  | { type: "transformCancel" }
   | { type: "line"; x0: number; y0: number; x1: number; y1: number; pressure: number; commit: boolean }
   | { type: "clear" }
   | { type: "undo" }
@@ -142,6 +146,7 @@ export type FromWorker =
   | { type: "png"; id: number; blob: Blob }
   | { type: "file"; id: number; bytes: ArrayBuffer }
   | { type: "thumbnails"; size: number; items: Array<{ id: number; bitmap: ImageBitmap }> }
+  | { type: "floating"; rect: [number, number, number, number] | null; failed?: boolean }
   | { type: "sample"; id: number; rgb: [number, number, number]; alpha: number }
   | { type: "readback"; id: number; painted: number }
   | { type: "error"; message: string };

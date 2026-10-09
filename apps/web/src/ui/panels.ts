@@ -27,8 +27,50 @@ export interface Ctx {
     exportPng: () => void;
     eyedropOnce: () => void;
     thumbnails: () => void;
-    setTool: (tool: "brush" | "select" | "fill") => void;
+    setTool: (tool: "brush" | "select" | "fill" | "transform") => void;
+    /** 変形: 持ち上げる / 置く / 戻す / 反転や回転 */
+    transformBegin: () => void;
+    transformCommit: () => void;
+    transformCancel: () => void;
+    transformDelta: (delta: [number, number, number, number, number, number]) => void;
   };
+}
+
+// ---- 変形 ----
+
+export function renderTransformPanel(body: HTMLElement, ctx: Ctx): void {
+  const { state, act } = ctx;
+  act.setTool("transform");
+  if (!state.transform) act.transformBegin();
+  body.append(el.title("変形"));
+  const help = document.createElement("div");
+  help.className = "phelp";
+  help.textContent = state.transform
+    ? "ドラッグで移動、隅をつまんで拡縮(CTL で縦横比を崩す)、2 本指で拡縮と回転。"
+    : "持ち上げるものがありません(選択範囲か、絵のあるレイヤーが要ります)。";
+  body.append(help);
+  if (state.transform) {
+    body.append(
+      el.row(
+        el.button("左右反転", () => act.transformDelta([-1, 0, 0, 1, 0, 0]), "swap"),
+        el.button("上下反転", () => act.transformDelta([1, 0, 0, -1, 0, 0]), "swap"),
+        el.button("90° 右", () => act.transformDelta([0, 1, -1, 0, 0, 0]), "transform"),
+        el.button("90° 左", () => act.transformDelta([0, -1, 1, 0, 0, 0]), "transform")
+      )
+    );
+    body.append(el.title("確定"));
+    body.append(
+      el.row(
+        el.button("置く(確定)", act.transformCommit, "fit", "on"),
+        el.button("取消", act.transformCancel, "clear")
+      )
+    );
+  } else {
+    body.append(el.button("ブラシへ", () => {
+      act.setTool("brush");
+      ctx.shell.closePanel();
+    }, "brush"));
+  }
 }
 
 // ---- 選択 ----
@@ -225,7 +267,12 @@ export function canvasMenu(ctx: Ctx): RadialMenu {
       icon: ICONS.select,
       run: () => shell.openPanel("select", (b) => renderSelectPanel(b, ctx)),
     },
-    SE: later("変形"),
+    SE: {
+      label: "変形",
+      sub: ctx.state.hasSelection ? "選択範囲を" : "レイヤーを",
+      icon: ICONS.transform,
+      run: () => shell.openPanel("transform", (b) => renderTransformPanel(b, ctx)),
+    },
     S: {
       label: "塗り",
       sub: "バケツ",

@@ -274,6 +274,17 @@ function mat3(a: number, b: number, c: number, d: number, e: number, f: number):
   return new Float32Array([a, b, 0, c, d, 0, e, f, 1]);
 }
 
+/** 列優先 3×3 の積 p · q。 */
+function mat3mul(p: Mat3, q: Mat3): Mat3 {
+  const r = new Float32Array(9);
+  for (let col = 0; col < 3; col++) {
+    for (let row = 0; row < 3; row++) {
+      r[col * 3 + row] = p[row]! * q[col * 3]! + p[3 + row]! * q[col * 3 + 1]! + p[6 + row]! * q[col * 3 + 2]!;
+    }
+  }
+  return r;
+}
+
 /** FBO 用: px → NDC(行 0 が下)。 */
 function fboMatrix(w: number, h: number): Mat3 {
   return mat3(2 / w, 0, 0, 2 / h, -1, -1);
@@ -316,6 +327,8 @@ export class Renderer {
   private clip: Target | null = null;
   /** 選択範囲(R8、doc サイズ)。無ければ null */
   private sel: Target | null = null;
+  /** 変形中に持ち上げている画素(RGBA8、矩形サイズ) */
+  private floating: { t: Target; x: number; y: number } | null = null;
   private selProg!: WebGLProgram;
   private s = {} as Record<string, WebGLUniformLocation>;
   private quadVbo!: WebGLBuffer;
@@ -502,6 +515,25 @@ export class Renderer {
 
   get hasSelection(): boolean {
     return this.sel !== null;
+  }
+
+  /** 変形で持ち上げた画素(プリマルチ RGBA8、w × h)。 */
+  uploadFloating(x: number, y: number, w: number, h: number, data: Uint8Array): void {
+    const gl = this.gl;
+    this.clearFloating();
+    const t = this.target(Math.max(1, w), Math.max(1, h), false, true);
+    gl.bindTexture(gl.TEXTURE_2D, t.tex);
+    gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, data);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    this.floating = { t, x, y };
+  }
+
+  clearFloating(): void {
+    if (this.floating) {
+      this.drop(this.floating.t);
+      this.floating = null;
+    }
   }
 
   /** クリッピングの土台のアルファ(A8、doc 全面)。null で解除。 */
@@ -695,7 +727,8 @@ export class Renderer {
     activeOpacity = 1,
     activeVisible = true,
     blendMode = 0,
-    useClip = false
+    useClip = false,
+    floatM: number[] | null = null
   ): void {
     const gl = this.gl;
     const p0 = this.p0;
@@ -742,6 +775,29 @@ export class Renderer {
     this.drawCalls++;
     gl.enable(gl.BLEND);
     gl.activeTexture(gl.TEXTURE0);
+
+    // 変形中の持ち上げ(編集中レイヤーの一部として、合成モードは掛けずに src-over)
+    if (this.floating && floatM) {
+      const f = this.floating;
+      // doc→NDC · 変形 · 矩形の原点
+      const tm = mat3(floatM[0]!, floatM[1]!, floatM[2]!, floatM[3]!, floatM[4]!, floatM[5]!);
+      const mm = mat3mul(m, mat3mul(tm, mat3(1, 0, 0, 1, f.x, f.y)));
+      gl.bindFramebuffer(gl.FRAMEBUFFER, p1.fbo);
+      gl.viewport(0, 0, this.viewW, this.viewH);
+      gl.useProgram(this.blitProg);
+      gl.uniform2f(this.u.uDoc!, f.t.w, f.t.h);
+      gl.uniformMatrix3fv(this.u.uM!, false, mm);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, f.t.tex);
+      gl.uniform1i(this.u.uTex!, 0);
+      gl.uniform1f(this.u.uOpacity!, activeVisible ? activeOpacity : 0);
+      gl.uniform1f(this.u.uDither!, 0);
+      gl.uniform1i(this.u.uMode!, 0);
+      gl.bindVertexArray(this.blitVao);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      this.drawCalls++;
+    }
 
     // 上まとめ
     this.blit(this.above, p1, m, 1, false, 0);

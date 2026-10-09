@@ -6,6 +6,7 @@ use crate::cel::{Blend, Cel, Snapshot};
 use crate::history::{Entry, History};
 use crate::selection::{region_by_color, Mask, SelectMode};
 use crate::tile::{PixelFormat, Rect, TileKey};
+use crate::transform::{resample, Affine, Floating};
 
 pub type LayerId = u32;
 
@@ -57,6 +58,8 @@ pub struct Document {
     history: History,
     /// 選択範囲(A8 全面)。None は「全部」
     selection: Option<Cel>,
+    /// 変形中に持ち上げている画素
+    floating: Option<(LayerId, Floating)>,
 }
 
 /// 変わったタイル(GPU が再転送すべきもの)。
@@ -71,7 +74,109 @@ impl Document {
             next_id: 1,
             history: History::new(history_limit_bytes),
             selection: None,
+            floating: None,
         }
+    }
+
+    // ---- 変形 ----
+
+    pub fn floating(&self) -> Option<&Floating> {
+        self.floating.as_ref().map(|(_, f)| f)
+    }
+
+    /// 選択範囲(無ければ絵のある範囲)を持ち上げる。レイヤーからはその分を消す(履歴に積む)。
+    /// 戻り値は持ち上げた矩形。何も無ければ None。
+    pub fn begin_transform(&mut self, layer: LayerId) -> Option<Rect> {
+        if self.floating.is_some() {
+            return None;
+        }
+        let l = self.layer(layer)?;
+        let rect = match &self.selection {
+            Some(c) => Mask::from_cel(c).bounds(),
+            None => {
+                // タイルの範囲から、絵のある所だけに詰める
+                let keys = l.cel.keys();
+                let mut b = Rect::default();
+                for k in keys {
+                    b = b.union(&k.rect().intersect(&self.bounds()));
+                }
+                if b.is_empty() {
+                    b
+                } else {
+                    let px = l.read_rgba(b);
+                    let mut m = Mask::new(b.w as u32, b.h as u32);
+                    for (d, p) in m.data.iter_mut().zip(px.chunks_exact(4)) {
+                        *d = p[3];
+                    }
+                    let t = m.bounds();
+                    if t.is_empty() {
+                        t
+                    } else {
+                        Rect::new(b.x + t.x, b.y + t.y, t.w, t.h)
+                    }
+                }
+            }
+        };
+        if rect.is_empty() {
+            return None;
+        }
+        let mut data = l.read_rgba(rect);
+        let mask = self.selection.as_ref().map(|c| c.read_rect(rect));
+        if let Some(m) = &mask {
+            for (p, &k) in data.chunks_exact_mut(4).zip(m) {
+                if k == 255 {
+                    continue;
+                }
+                for c in 0..4 {
+                    p[c] = ((p[c] as u32 * k as u32 + 127) / 255) as u8;
+                }
+            }
+        }
+        // 持ち上げた分を消す(マスクの濃さぶんだけ)
+        let erase: Vec<u8> = match &mask {
+            Some(m) => m.iter().flat_map(|&k| [0, 0, 0, k]).collect(),
+            None => vec![255u8; rect.w as usize * rect.h as usize * 4],
+        };
+        let lm = self.layer_mut(layer)?;
+        let snap = lm.cel.composite(rect, &erase, 1.0, Blend::Erase);
+        self.record(layer, "変形(持ち上げ)", snap);
+        self.floating = Some((layer, Floating { rect, data, mask }));
+        Some(rect)
+    }
+
+    /// 変形して置く。選択範囲も一緒に動かす。戻り値は変わったタイル。
+    pub fn commit_transform(&mut self, m: Affine) -> Vec<TileKey> {
+        let Some((layer, f)) = self.floating.take() else { return Vec::new() };
+        let dst = m.bounds_of(f.rect).intersect(&self.bounds());
+        let mut changed = Vec::new();
+        if !dst.is_empty() {
+            let px = resample(&f.data, f.rect, 4, &m, dst);
+            if let Some(l) = self.layer_mut(layer) {
+                let snap = l.cel.composite(dst, &px, 1.0, Blend::Normal);
+                changed = self.record(layer, "変形", snap);
+            }
+            if let Some(mask) = &f.mask {
+                let mv = resample(mask, f.rect, 1, &m, dst);
+                let mut sel = Mask::new(self.width, self.height);
+                for y in 0..dst.h as usize {
+                    let row = (dst.y as usize + y) * self.width as usize + dst.x as usize;
+                    sel.data[row..row + dst.w as usize]
+                        .copy_from_slice(&mv[y * dst.w as usize..(y + 1) * dst.w as usize]);
+                }
+                self.set_selection_mask(sel);
+            }
+        } else if f.mask.is_some() {
+            self.selection = None;
+        }
+        changed
+    }
+
+    /// 変形をやめて元の場所へ戻す。
+    pub fn cancel_transform(&mut self) -> Vec<TileKey> {
+        let Some((layer, f)) = self.floating.take() else { return Vec::new() };
+        let Some(l) = self.layer_mut(layer) else { return Vec::new() };
+        let snap = l.cel.composite(f.rect, &f.data, 1.0, Blend::Normal);
+        self.record(layer, "変形(取消)", snap)
     }
 
     // ---- 選択範囲 ----
@@ -833,6 +938,45 @@ mod tests {
         doc.delete_selection(a);
         assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(12, 12, 1, 1))[3], 0);
         assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(0, 0, 1, 1))[3], 255, "選択の外は残る");
+    }
+
+    #[test]
+    fn transform_lifts_moves_and_cancels() {
+        let mut doc = Document::new(64, 64, 1 << 20);
+        let a = doc.add_layer(PixelFormat::Rgba8, "a");
+        let r = Rect::new(10, 10, 4, 4);
+        doc.composite_stroke(a, r, &solid(r, [0, 0, 255, 255]), 1.0, Blend::Normal);
+        // 全体を持ち上げると元は消える
+        let lifted = doc.begin_transform(a).unwrap();
+        assert_eq!(lifted, r, "選択が無ければ絵のある範囲");
+        assert_eq!(doc.layer(a).unwrap().cel.read_rect(r)[3], 0);
+        assert!(doc.floating().is_some());
+        assert!(doc.begin_transform(a).is_none(), "二重には持ち上げない");
+        // 右へ 20 動かして置く
+        let m = Affine { e: 20.0, ..Affine::IDENTITY };
+        let changed = doc.commit_transform(m);
+        assert!(!changed.is_empty());
+        assert!(doc.floating().is_none());
+        assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(30, 10, 1, 1)), vec![0, 0, 255, 255]);
+        assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(10, 10, 1, 1))[3], 0);
+        // 戻すと 2 段階(置く、持ち上げ)で元に戻る
+        doc.undo();
+        doc.undo();
+        assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(10, 10, 1, 1))[3], 255);
+        // 選択範囲つき: 選択だけ持ち上がり、選択も一緒に動く
+        doc.select_rect(Rect::new(10, 10, 2, 4), SelectMode::Replace);
+        let lifted = doc.begin_transform(a).unwrap();
+        assert_eq!(lifted, Rect::new(10, 10, 2, 4));
+        assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(12, 10, 1, 1))[3], 255, "選択の外は残る");
+        doc.commit_transform(Affine { f: 30.0, ..Affine::IDENTITY });
+        assert_eq!(doc.selection_bounds(), Rect::new(10, 40, 2, 4));
+        assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(10, 40, 1, 1))[3], 255);
+        // 取消は元の場所へ戻す
+        doc.select_none();
+        doc.begin_transform(a).unwrap();
+        assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(10, 40, 1, 1))[3], 0);
+        doc.cancel_transform();
+        assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(10, 40, 1, 1))[3], 255);
     }
 
     #[test]
