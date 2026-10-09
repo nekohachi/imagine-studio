@@ -94,6 +94,103 @@ impl Document {
         self.layers.last_mut()
     }
 
+    /// レイヤーを消す。履歴のうちこのレイヤーに触れる項目はそのまま残るが、
+    /// 入れ替え先が無いので無視される(フェーズ 3。構造の Undo は後で)。
+    pub fn remove_layer(&mut self, id: LayerId) -> bool {
+        let Some(i) = self.index_of(id) else { return false };
+        if self.layers.len() <= 1 {
+            return false;
+        }
+        self.layers.remove(i);
+        true
+    }
+
+    /// 複製して、元のすぐ上に置く。新しい id を返す。
+    pub fn duplicate_layer(&mut self, id: LayerId) -> Option<LayerId> {
+        let i = self.index_of(id)?;
+        let src = &self.layers[i];
+        let new_id = self.next_id;
+        self.next_id += 1;
+        let mut cel = Cel::new(src.cel.format(), self.width, self.height);
+        for k in src.cel.keys() {
+            if let Some(t) = src.cel.tile(k) {
+                cel.restore(k, Some(t.clone()));
+            }
+        }
+        cel.take_dirty();
+        let layer = Layer {
+            id: new_id,
+            name: format!("{} のコピー", src.name),
+            visible: src.visible,
+            opacity: src.opacity,
+            cel,
+        };
+        self.layers.insert(i + 1, layer);
+        Some(new_id)
+    }
+
+    /// 並びを変える。`to` は移動後の添字(下から)。
+    pub fn move_layer(&mut self, id: LayerId, to: usize) -> bool {
+        let Some(i) = self.index_of(id) else { return false };
+        let to = to.min(self.layers.len() - 1);
+        if i == to {
+            return true;
+        }
+        let l = self.layers.remove(i);
+        self.layers.insert(to, l);
+        true
+    }
+
+    pub fn set_layer_name(&mut self, id: LayerId, name: &str) {
+        if let Some(l) = self.layer_mut(id) {
+            l.name = name.to_string();
+        }
+    }
+
+    /// 下のレイヤーへ結合する(通常合成、不透明度込み)。下のレイヤーの画素変更は履歴に積む。
+    /// 結合先が A8 なら、上のレイヤーのアルファだけを使う。戻り値は変わったタイル(下のレイヤー)。
+    pub fn merge_down(&mut self, id: LayerId) -> Option<(LayerId, Vec<TileKey>)> {
+        let i = self.index_of(id)?;
+        if i == 0 {
+            return None;
+        }
+        let upper = self.layers.remove(i);
+        let lower_id = self.layers[i - 1].id;
+        if !upper.visible || upper.opacity <= 0.0 {
+            return Some((lower_id, Vec::new()));
+        }
+        let mut all_changed = Vec::new();
+        for k in upper.cel.keys() {
+            let Some(t) = upper.cel.tile(k) else { continue };
+            // タイルをプリマルチ RGBA8 の矩形にして、通常合成で焼く
+            let rect = k.rect().intersect(&self.bounds());
+            if rect.is_empty() {
+                continue;
+            }
+            let src = match t.format {
+                PixelFormat::Rgba8 => upper.cel.read_rect(rect),
+                PixelFormat::A8 => upper
+                    .cel
+                    .read_rect(rect)
+                    .into_iter()
+                    .flat_map(|a| [0, 0, 0, a])
+                    .collect(),
+            };
+            let lower = &mut self.layers[i - 1];
+            let snap = lower.cel.composite(rect, &src, upper.opacity, Blend::Normal);
+            let keys: Vec<_> = snap.iter().map(|(k, _)| *k).collect();
+            self.history.push(Entry {
+                label: "結合".into(),
+                layer: lower_id,
+                tiles: snap,
+            });
+            all_changed.extend(keys);
+        }
+        all_changed.sort();
+        all_changed.dedup();
+        Some((lower_id, all_changed))
+    }
+
     pub fn index_of(&self, id: LayerId) -> Option<usize> {
         self.layers.iter().position(|l| l.id == id)
     }
@@ -357,6 +454,52 @@ mod tests {
         // 上まで見ると赤と青の半々
         let both = doc.sample_over_white(1, 0, 0);
         assert!((both[0] - 0.5).abs() < 0.02 && (both[2] - 0.5).abs() < 0.02, "{both:?}");
+    }
+
+    #[test]
+    fn layer_ops_remove_duplicate_move_merge() {
+        let mut doc = Document::new(256, 256, 1 << 20);
+        let a = doc.add_layer(PixelFormat::Rgba8, "a");
+        let b = doc.add_layer(PixelFormat::Rgba8, "b");
+        let r = Rect::new(0, 0, 2, 2);
+        doc.composite_stroke(b, r, &solid(r, [0, 0, 255, 255]), 1.0, Blend::Normal);
+        // 複製は元のすぐ上、画素も同じ
+        let c = doc.duplicate_layer(b).unwrap();
+        assert_eq!(doc.index_of(c), Some(2));
+        assert_eq!(doc.layer(c).unwrap().cel.read_rect(r), doc.layer(b).unwrap().cel.read_rect(r));
+        // 並び替え
+        assert!(doc.move_layer(c, 0));
+        assert_eq!(doc.layers().iter().map(|l| l.id).collect::<Vec<_>>(), vec![c, a, b]);
+        // 結合: b を a に
+        doc.layer_mut(b).unwrap().opacity = 0.5;
+        let (lower, changed) = doc.merge_down(b).unwrap();
+        assert_eq!(lower, a);
+        assert_eq!(changed.len(), 1);
+        assert!(doc.layer(b).is_none());
+        let px = doc.layer(a).unwrap().cel.read_rect(r);
+        assert!((px[3] as i32 - 128).abs() <= 1, "{px:?}");
+        // 結合の画素変更は戻せる
+        doc.undo();
+        assert_eq!(doc.layer(a).unwrap().cel.tile_count(), 0);
+        // 最後の 1 枚は消せない
+        assert!(doc.remove_layer(c));
+        assert!(!doc.remove_layer(a));
+        doc.set_layer_name(a, "下地");
+        assert_eq!(doc.layer(a).unwrap().name, "下地");
+    }
+
+    #[test]
+    fn thumbnail_samples_center() {
+        let mut doc = Document::new(512, 512, 1 << 20);
+        let a = doc.add_layer(PixelFormat::A8, "ink");
+        let r = Rect::new(0, 0, 256, 512);
+        doc.composite_stroke(a, r, &solid(r, [0, 0, 0, 255]), 1.0, Blend::Normal);
+        let th = doc.layer(a).unwrap().cel.thumbnail(4, 2);
+        // 左半分は黒インク、右半分は透明
+        assert_eq!(th[3], 255);
+        assert_eq!(th[1 * 4 + 3], 255);
+        assert_eq!(th[2 * 4 + 3], 0);
+        assert_eq!(th[3 * 4 + 3], 0);
     }
 
     #[test]

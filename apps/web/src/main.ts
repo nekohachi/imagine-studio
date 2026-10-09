@@ -1,205 +1,117 @@
-// メインスレッド: DOM と入力だけ。描画は worker.ts に任せる。
-//
-// 入力の流れ(docs/04):
-//   pointer イベント → getCoalescedEvents で全点を取る → 画面 px をドキュメント px に直す
-//   → PointPacker に溜める → rAF ごとに 1 回ワーカーへ転送 → ワーカーが描く
-// 指 2 本はパン・ズーム・回転。rAF はストローク中とジェスチャ中だけ回す。
-
-import { PalmGuard, PointPacker, SpeedPressure, normalizePressure } from "./input";
+// メインスレッドの入口。ワーカーをつなぎ、シェルと入力とパネルを組み立てる。
+import "@imagine/ring/ring.css";
+import { Gauge, Modifiers, attachRadialButton, type RadialMenu } from "@imagine/ring";
+import { Bridge } from "./bridge";
+import { CanvasInput } from "./canvasInput";
+import type { BrushJson, BrushPreset, LayerInfo, Stats } from "./protocol";
+import { AppState } from "./state";
+import { hexToRgb, rgbToHex, type Rgb } from "./ui/color";
+import { ICONS } from "./ui/icons";
 import {
-  POINT_STRIDE,
-  type BrushJson,
-  type BrushPreset,
-  type FromWorker,
-  type LayerInfo,
-  type Stats,
-  type ToWorker,
-  type View,
-} from "./protocol";
-import { TwoFingerGesture, fitView, screenToDoc, zoomAt } from "./view";
+  canvasMenu,
+  canvasMenuList,
+  renderActionsPanel,
+  renderBrushPanel,
+  renderColorPanel,
+  renderLaterPanel,
+  renderLayersPanel,
+  setThumbnails,
+  viewMenu,
+  type Ctx,
+} from "./ui/panels";
+import { buildShell } from "./ui/shell";
 
 declare const __BUILD__: string;
-
-let DOC_W = 2048;
-let DOC_H = 2048;
 
 const canvas = document.getElementById("canvas") as HTMLCanvasElement;
 const hud = document.getElementById("hud")!;
 const errBox = document.getElementById("err")!;
+const fileInput = document.getElementById("file") as HTMLInputElement;
 
 function showError(msg: string): void {
   errBox.style.display = "block";
   errBox.textContent = msg;
+  setTimeout(() => {
+    errBox.style.display = "none";
+  }, 8000);
 }
 
-const dpr = Math.min(window.devicePixelRatio || 1, 3);
-const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
-const send = (m: ToWorker, transfer: Transferable[] = []) => worker.postMessage(m, transfer);
+const state = new AppState();
+state.color = hexToRgb(state.settings.color) ?? state.color;
+state.sub = hexToRgb(state.settings.sub) ?? state.sub;
+const bridge = new Bridge();
+bridge.onError(showError);
+const shell = buildShell(document.getElementById("ui")!);
+const mods = new Modifiers();
 
-function backing(): [number, number] {
-  return [Math.round(canvas.clientWidth * dpr), Math.round(canvas.clientHeight * dpr)];
-}
-
-let view: View;
+// ---- ワーカーの起動 ----
 {
-  const [w, h] = backing();
-  view = fitView(DOC_W, DOC_H, w, h);
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
   const offscreen = canvas.transferControlToOffscreen();
-  send({ type: "init", canvas: offscreen, viewW: w, viewH: h, docW: DOC_W, docH: DOC_H, view }, [offscreen]);
-}
-window.addEventListener("resize", () => {
-  const [w, h] = backing();
-  send({ type: "resize", viewW: w, viewH: h });
-});
-
-// ---- ブラシ設定 ----
-// ブラシは JSON の定義(brush-core の BrushDef)。スライダーはその一部を直接触る。
-// ブラシスタジオの UI はフェーズ 3。今は JSON の欄で全部の項目を触れるようにしてある。
-const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
-const inputs = {
-  preset: $<HTMLSelectElement>("preset"),
-  radius: $<HTMLInputElement>("radius"),
-  stab: $<HTMLInputElement>("stab"),
-  hard: $<HTMLInputElement>("hard"),
-  opacity: $<HTMLInputElement>("opacity"),
-  predict: $<HTMLInputElement>("predict"),
-  finger: $<HTMLInputElement>("finger"),
-  eraser: $<HTMLInputElement>("eraser"),
-  color: $<HTMLInputElement>("color"),
-  layer: $<HTMLSelectElement>("layer"),
-  visible: $<HTMLInputElement>("visible"),
-  json: $<HTMLTextAreaElement>("brushJson"),
-  jsonBox: $<HTMLElement>("brushJsonBox"),
-};
-
-let presets: BrushPreset[] = [];
-let def: BrushJson = {
-  name: "ブラシ",
-  size: 6,
-  stabilizer: 8,
-  hardness: 0.7,
-  opacity: 1,
-  eraser: false,
-};
-
-function hexToRgb(hex: string): [number, number, number] {
-  const n = parseInt(hex.slice(1), 16);
-  return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+  state.view = { scale: 1, tx: 0, ty: 0, rot: 0 };
+  bridge.send({ type: "init", canvas: offscreen, viewW: w, viewH: h, docW: state.docW, docH: state.docH, view: state.view }, [offscreen]);
 }
 
-/** def をスライダーと JSON 欄に映す。 */
-function showDef(): void {
-  inputs.radius.value = String(def.size);
-  inputs.stab.value = String(def.stabilizer);
-  inputs.hard.value = String(def.hardness);
-  inputs.opacity.value = String(def.opacity);
-  inputs.eraser.checked = Boolean(def.eraser);
-  $("radiusV").textContent = String(def.size);
-  $("stabV").textContent = String(def.stabilizer);
-  $("hardV").textContent = String(def.hardness);
-  $("opacityV").textContent = String(def.opacity);
-  if (document.activeElement !== inputs.json) inputs.json.value = JSON.stringify(def, null, 2);
-}
-
+// ---- ブラシと色 ----
 function pushBrush(): void {
-  send({ type: "brush", brush: { json: JSON.stringify(def), color: hexToRgb(inputs.color.value) } });
+  bridge.send({ type: "brush", brush: { json: JSON.stringify(state.brush), color: state.color } });
+  state.emit("brush");
 }
 
-function readSliders(): void {
-  def.size = Number(inputs.radius.value);
-  def.stabilizer = Number(inputs.stab.value);
-  def.hardness = Number(inputs.hard.value);
-  def.opacity = Number(inputs.opacity.value);
-  def.eraser = inputs.eraser.checked;
-  showDef();
+function setBrush(p: BrushPreset): void {
+  state.brush = JSON.parse(p.json) as BrushJson;
+  state.brushBeforeEraser = null;
+  state.settings.lastBrush = p.name;
+  state.save();
+  pushBrush();
+  shell.toast(p.name);
+}
+
+function setBrushJson(b: BrushJson): void {
+  state.brush = b;
   pushBrush();
 }
-for (const el of [inputs.radius, inputs.stab, inputs.hard, inputs.opacity, inputs.eraser]) {
-  el.addEventListener("input", readSliders);
-}
-inputs.color.addEventListener("input", pushBrush);
 
-inputs.preset.addEventListener("change", () => {
-  const p = presets[Number(inputs.preset.value)];
-  if (!p) return;
-  def = JSON.parse(p.json) as BrushJson;
-  showDef();
-  pushBrush();
-});
-
-$("brushJsonToggle").addEventListener("click", () => {
-  inputs.jsonBox.hidden = !inputs.jsonBox.hidden;
-});
-$("brushJsonApply").addEventListener("click", () => {
-  try {
-    def = JSON.parse(inputs.json.value) as BrushJson;
-    showDef();
-    pushBrush();
-  } catch (e) {
-    showError("ブラシ JSON が読めない: " + String(e));
+function toggleEraser(): void {
+  if (state.brush.eraser) {
+    const back = state.presetByName(state.brushBeforeEraser ?? state.settings.lastBrush) ?? state.presets[0];
+    if (back) setBrush(back);
+    return;
   }
-});
-
-function applyPresets(list: BrushPreset[]): void {
-  presets = list;
-  inputs.preset.innerHTML = "";
-  list.forEach((p, i) => {
-    const o = document.createElement("option");
-    o.value = String(i);
-    o.textContent = p.name;
-    inputs.preset.appendChild(o);
-  });
-  // 既定はペン
-  const idx = Math.max(0, list.findIndex((p) => p.name === "ペン"));
-  inputs.preset.value = String(idx);
-  const p = list[idx];
-  if (p) def = JSON.parse(p.json) as BrushJson;
-  showDef();
+  const e = state.presets.find((p) => (JSON.parse(p.json) as BrushJson).eraser);
+  if (!e) return;
+  state.brushBeforeEraser = state.brush.name;
+  // 太さは今のブラシを引き継ぐ
+  const size = state.brush.size;
+  state.brush = { ...(JSON.parse(e.json) as BrushJson), size };
   pushBrush();
 }
-showDef();
-pushBrush();
-$("undo").addEventListener("click", () => send({ type: "undo" }));
-$("redo").addEventListener("click", () => send({ type: "redo" }));
-$("clear").addEventListener("click", () => send({ type: "clear" }));
-$("fit").addEventListener("click", () => {
-  const [w, h] = backing();
-  view = fitView(DOC_W, DOC_H, w, h);
-  send({ type: "view", view });
-});
-$("addLayer").addEventListener("click", () => {
-  send({ type: "addLayer", a8: false, name: `レイヤー ${inputs.layer.options.length + 1}` });
-});
-inputs.layer.addEventListener("change", () => send({ type: "setLayer", id: Number(inputs.layer.value) }));
-inputs.visible.addEventListener("change", () =>
-  send({ type: "setLayerVisible", id: Number(inputs.layer.value), visible: inputs.visible.checked })
-);
 
-let pngId = 0;
-$("png").addEventListener("click", () => send({ type: "exportPng", id: ++pngId }));
+function setColor(c: Rgb, remember = false): void {
+  state.color = c;
+  state.settings.color = rgbToHex(c);
+  if (remember) {
+    const hex = rgbToHex(c);
+    state.settings.recentColors = [hex, ...state.settings.recentColors.filter((h) => h !== hex)].slice(0, 12);
+  }
+  state.save();
+  bridge.send({ type: "brush", brush: { json: JSON.stringify(state.brush), color: state.color } });
+  state.emit("color");
+}
 
-let saveId = 0;
-$("save").addEventListener("click", () => send({ type: "save", id: ++saveId }));
-const fileInput = $<HTMLInputElement>("file");
-$("open").addEventListener("click", () => fileInput.click());
-fileInput.addEventListener("change", async () => {
-  const f = fileInput.files?.[0];
-  fileInput.value = "";
-  if (!f) return;
-  const bytes = await f.arrayBuffer();
-  send({ type: "open", bytes }, [bytes]);
-});
-$("new").addEventListener("click", () => {
-  const ans = window.prompt("新しい作品の大きさ(幅x高さ、px)", `${DOC_W}x${DOC_H}`);
-  if (!ans) return;
-  const m = /^\s*(\d+)\s*[x×*,\s]\s*(\d+)\s*$/i.exec(ans);
-  if (!m) return;
-  const w = Math.min(8192, Math.max(16, Number(m[1])));
-  const h = Math.min(8192, Math.max(16, Number(m[2])));
-  if (!window.confirm(`今の作品を捨てて ${w}×${h} で始めますか?`)) return;
-  send({ type: "newDoc", docW: w, docH: h });
-});
+function swapColors(): void {
+  const t = state.color;
+  state.color = state.sub;
+  state.sub = t;
+  state.settings.color = rgbToHex(state.color);
+  state.settings.sub = rgbToHex(state.sub);
+  setColor(state.color);
+}
 
+// ---- ファイル ----
+let fileId = 0;
 function download(blob: Blob, name: string): void {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -208,301 +120,286 @@ function download(blob: Blob, name: string): void {
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
+fileInput.addEventListener("change", async () => {
+  const f = fileInput.files?.[0];
+  fileInput.value = "";
+  if (!f) return;
+  const bytes = await f.arrayBuffer();
+  bridge.send({ type: "open", bytes }, [bytes]);
+});
 
-function setDocSize(w: number, h: number): void {
-  DOC_W = w;
-  DOC_H = h;
-  const [vw, vh] = backing();
-  view = fitView(DOC_W, DOC_H, vw, vh);
-  send({ type: "view", view });
-}
-
-function applyLayers(layers: LayerInfo[], active: number): void {
-  inputs.layer.innerHTML = "";
-  // 上が先に見えるように逆順で並べる
-  for (const l of [...layers].reverse()) {
-    const o = document.createElement("option");
-    o.value = String(l.id);
-    o.textContent = (l.visible ? "" : "(非表示) ") + l.name;
-    if (l.id === active) o.selected = true;
-    inputs.layer.appendChild(o);
-  }
-  const cur = layers.find((l) => l.id === active);
-  inputs.visible.checked = cur ? cur.visible : true;
+function newDoc(): void {
+  const ans = window.prompt("新しい作品の大きさ(幅x高さ、px)", `${state.docW}x${state.docH}`);
+  if (!ans) return;
+  const m = /^\s*(\d+)\s*[x×*,\s]\s*(\d+)\s*$/i.exec(ans);
+  if (!m) return;
+  const w = Math.min(8192, Math.max(16, Number(m[1])));
+  const h = Math.min(8192, Math.max(16, Number(m[2])));
+  if (!window.confirm(`今の作品を捨てて ${w}×${h} で始めますか?`)) return;
+  bridge.send({ type: "newDoc", docW: w, docH: h });
 }
 
 // ---- 入力 ----
-const packer = new PointPacker();
-const palm = new PalmGuard(1500);
-const speedPressure = new SpeedPressure();
-const gesture = new TwoFingerGesture();
-const hasRawUpdate = "onpointerrawupdate" in window;
-const hasPredicted = typeof PointerEvent !== "undefined" && "getPredictedEvents" in PointerEvent.prototype;
-const hasCoalesced = typeof PointerEvent !== "undefined" && "getCoalescedEvents" in PointerEvent.prototype;
-
-let activeId: number | null = null;
-let activeType = "";
-let predicted = new Float32Array(0);
-let rafId = 0;
-let viewDirty = false;
-let lastMove: { x: number; y: number; t: number } | null = null;
-const touches = new Map<number, [number, number]>();
-
-const inputStats = {
-  events: 0,
-  coalesced: 0,
-  pointerType: "-",
-  pressure: 0,
-  tiltX: 0,
-  tiltY: 0,
-  eventsPerFrame: 0,
+const ctx: Ctx = {
+  state,
+  bridge,
+  shell,
+  act: {
+    setBrush,
+    setBrushJson,
+    setColor,
+    swapColors,
+    toggleEraser,
+    setLayer: (id) => bridge.send({ type: "setLayer", id }),
+    undo: () => bridge.send({ type: "undo" }),
+    redo: () => bridge.send({ type: "redo" }),
+    fit: () => input.fit(),
+    newDoc,
+    open: () => fileInput.click(),
+    save: () => bridge.send({ type: "save", id: ++fileId }),
+    exportPng: () => bridge.send({ type: "exportPng", id: ++fileId }),
+    eyedropOnce: () => {
+      state.eyedropOnce = true;
+      shell.toast("次にタップした所の色を拾います");
+    },
+    thumbnails: () => requestThumbnails(),
+  },
 };
 
-function toScreen(e: { clientX: number; clientY: number }): [number, number] {
-  const r = canvas.getBoundingClientRect();
-  return [(e.clientX - r.left) * dpr, (e.clientY - r.top) * dpr];
-}
-
-function toDoc(e: { clientX: number; clientY: number }): [number, number] {
-  const [sx, sy] = toScreen(e);
-  return screenToDoc(view, sx, sy);
-}
-
-function pressureOf(e: PointerEvent, x: number, y: number): number {
-  if (e.pointerType === "touch") {
-    const now = e.timeStamp;
-    let speed = 0;
-    if (lastMove) {
-      const dt = Math.max(1, now - lastMove.t);
-      speed = (Math.hypot(x - lastMove.x, y - lastMove.y) * view.scale) / dpr / dt;
+let eyedropId = 0;
+const input = new CanvasInput(canvas, state, bridge, mods, {
+  onRing: () => ({ menu: canvasMenu(ctx), list: canvasMenuList(ctx) }),
+  onViewRing: () => viewMenu(ctx),
+  onTap: (n, double) => {
+    if (n === 2 && double) ctx.act.undo();
+    else if (n === 3 && double) ctx.act.redo();
+    else if (n === 4 && !double) {
+      state.uiHidden = !state.uiHidden;
+      shell.setHidden(state.uiHidden);
     }
-    lastMove = { x, y, t: now };
-    return speedPressure.feed(speed);
-  }
-  return normalizePressure(e.pointerType, e.pressure);
-}
-
-function addPoint(e: PointerEvent): void {
-  const [x, y] = toDoc(e);
-  packer.push(x, y, pressureOf(e, x, y), e.timeStamp, e.tiltX, e.tiltY);
-  inputStats.events++;
-}
-
-function flush(): void {
-  if (viewDirty) {
-    viewDirty = false;
-    send({ type: "view", view });
-  }
-  if (activeId !== null || packer.length > 0) {
-    const data = packer.take();
-    inputStats.eventsPerFrame = data.length / POINT_STRIDE;
-    const pd = inputs.predict.checked ? predicted : new Float32Array(0);
-    predicted = new Float32Array(0);
-    send({ type: "points", data, predicted: pd, frameTime: performance.now() }, [data.buffer, pd.buffer]);
-  }
-  rafId = activeId !== null || gesture.active ? requestAnimationFrame(flush) : 0;
-}
-
-function ensureLoop(): void {
-  if (!rafId) rafId = requestAnimationFrame(flush);
-}
-
-function cancelStroke(): void {
-  if (activeId === null) return;
-  try {
-    canvas.releasePointerCapture(activeId);
-  } catch {
-    /* 既に外れている */
-  }
-  activeId = null;
-  packer.take();
-  send({ type: "cancel" });
-}
-
-canvas.addEventListener("pointerdown", (e) => {
-  if (e.pointerType === "pen") palm.sawPen(e.timeStamp);
-  if (e.pointerType === "touch") {
-    touches.set(e.pointerId, toScreen(e));
-    if (touches.size === 2) {
-      // 2 本目が乗ったらジェスチャ。指で描いていたら取り消す
-      if (activeType === "touch") cancelStroke();
-      const [a, b] = Array.from(touches.values()) as [[number, number], [number, number]];
-      gesture.start(view, a[0], a[1], b[0], b[1]);
-      ensureLoop();
-      return;
-    }
-    if (touches.size > 2) return;
-    if (!palm.allowTouch(e.timeStamp, inputs.finger.checked)) return;
-  }
-  if (activeId !== null) return;
-  if (e.pointerType === "mouse" && e.button !== 0) return;
-  activeId = e.pointerId;
-  activeType = e.pointerType;
-  inputStats.pointerType = e.pointerType;
-  speedPressure.reset();
-  lastMove = null;
-  canvas.setPointerCapture(e.pointerId);
-  send({ type: "begin" });
-  addPoint(e);
-  ensureLoop();
-});
-
-function collect(e: PointerEvent): void {
-  if (e.pointerId !== activeId) return;
-  const list: PointerEvent[] = hasCoalesced ? e.getCoalescedEvents() : [];
-  if (list.length === 0) list.push(e);
-  inputStats.coalesced = list.length;
-  for (const c of list) addPoint(c);
-  inputStats.pressure = e.pressure;
-  inputStats.tiltX = e.tiltX;
-  inputStats.tiltY = e.tiltY;
-  ensureLoop();
-}
-
-if (hasRawUpdate) {
-  // Chrome: 間引かれる前の生イベント。点はこちらで集め、pointermove は予測だけに使う
-  (canvas as unknown as { addEventListener(t: string, l: (e: PointerEvent) => void): void }).addEventListener(
-    "pointerrawupdate",
-    collect
-  );
-}
-
-canvas.addEventListener("pointermove", (e) => {
-  if (e.pointerType === "touch" && touches.has(e.pointerId)) {
-    touches.set(e.pointerId, toScreen(e));
-    if (gesture.active && touches.size >= 2) {
-      const [a, b] = Array.from(touches.values()) as [[number, number], [number, number]];
-      const v = gesture.update(a[0], a[1], b[0], b[1]);
-      if (v) {
-        view = v;
-        viewDirty = true;
-        ensureLoop();
-      }
-      return;
-    }
-  }
-  if (e.pointerId !== activeId) return;
-  if (!hasRawUpdate) collect(e);
-  if (hasPredicted) {
-    const ps = e.getPredictedEvents();
-    const out = new Float32Array(ps.length * POINT_STRIDE);
-    ps.forEach((p, i) => {
-      const [x, y] = toDoc(p);
-      out[i * POINT_STRIDE] = x;
-      out[i * POINT_STRIDE + 1] = y;
-      out[i * POINT_STRIDE + 2] = normalizePressure(activeType, p.pressure);
-      out[i * POINT_STRIDE + 3] = p.timeStamp;
-    });
-    predicted = out;
-  }
-});
-
-function finish(e: PointerEvent, cancel: boolean): void {
-  if (e.pointerType === "touch") {
-    touches.delete(e.pointerId);
-    if (gesture.active && touches.size < 2) gesture.end();
-  }
-  if (e.pointerId !== activeId) return;
-  if (!cancel) addPoint(e);
-  activeId = null;
-  // 残りの点を先に送ってから終了を送る(順序を保つ)
-  if (packer.length) {
-    const data = packer.take();
-    send({ type: "points", data, predicted: new Float32Array(0), frameTime: performance.now() }, [data.buffer]);
-  }
-  send({ type: cancel ? "cancel" : "end" });
-  try {
-    canvas.releasePointerCapture(e.pointerId);
-  } catch {
-    /* 既に外れている */
-  }
-}
-canvas.addEventListener("pointerup", (e) => finish(e, false));
-canvas.addEventListener("pointercancel", (e) => finish(e, true));
-canvas.addEventListener("contextmenu", (e) => e.preventDefault());
-
-// マウスのホイールでズーム(Windows)
-canvas.addEventListener(
-  "wheel",
-  (e) => {
-    e.preventDefault();
-    const [sx, sy] = toScreen(e);
-    view = zoomAt(view, sx, sy, Math.exp(-e.deltaY * 0.0015));
-    viewDirty = true;
-    ensureLoop();
   },
-  { passive: false }
+  onEyedrop: (x, y) => {
+    const id = ++eyedropId;
+    bridge.request((rid) => ({ type: "sample", id: rid + id * 0, x, y }), "sample").then((m) => {
+      setColor(m.rgb, true);
+      shell.toast(rgbToHex(m.rgb));
+    });
+  },
+  closePanels: () => {
+    if (!shell.panelOpen()) return false;
+    shell.closePanel();
+    return true;
+  },
+});
+
+// ---- 上バー ----
+const panels: Record<string, () => void> = {
+  gallery: () => shell.openPanel("gallery", (b) => renderActionsPanel(b, ctx)),
+  actions: () => shell.openPanel("actions", (b) => renderActionsPanel(b, ctx)),
+  adjust: () => shell.openPanel("adjust", (b) => renderLaterPanel(b, "調整")),
+  select: () => shell.openPanel("select", (b) => renderLaterPanel(b, "選択")),
+  transform: () => shell.openPanel("transform", (b) => renderLaterPanel(b, "変形")),
+  brush: () => shell.openPanel("brush", (b) => renderBrushPanel(b, ctx)),
+  layers: () => shell.openPanel("layers", (b) => renderLayersPanel(b, ctx)),
+  color: () => shell.openPanel("color", (b) => renderColorPanel(b, ctx)),
+};
+for (const [id, fn] of Object.entries(panels)) {
+  const b = shell.buttons[id]!;
+  if (id === "brush") {
+    // タップで一覧、長押しでお気に入りの輪(docs/04)
+    attachRadialButton(b, () => brushRing(), fn, () => canvasMenuList(ctx));
+  } else {
+    b.addEventListener("click", fn);
+  }
+}
+shell.buttons.smudge!.addEventListener("click", () => shell.toast("指先はフェーズ 4 で入ります"));
+shell.buttons.eraser!.addEventListener("click", toggleEraser);
+shell.buttons.undo!.addEventListener("click", ctx.act.undo);
+shell.buttons.redo!.addEventListener("click", ctx.act.redo);
+
+function brushRing(): RadialMenu {
+  const dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"] as const;
+  const menu: RadialMenu = {};
+  state.ringBrushes().forEach((p, i) => {
+    menu[dirs[i]!] = { label: p.name, icon: ICONS.brush, run: () => setBrush(p) };
+  });
+  return menu;
+}
+
+// ---- 左レール ----
+const sizeGauge = new Gauge(shell.gauges.size, {
+  label: "太さ",
+  // 2 乗のカーブ(細いところを細かく)
+  map: (t) => Math.max(0.5, Math.round(t * t * 200 * 2) / 2),
+  unmap: (v) => Math.sqrt(v / 200),
+  format: (v) => String(v),
+  get: () => Number(state.brush.size),
+  set: (v) => {
+    state.brush.size = v;
+    pushBrush();
+  },
+});
+const opacityGauge = new Gauge(shell.gauges.opacity, {
+  label: "濃さ",
+  map: (t) => Math.round(Math.max(0.05, t) * 100) / 100,
+  unmap: (v) => v,
+  format: (v) => `${Math.round(v * 100)}`,
+  get: () => Number(state.brush.opacity),
+  set: (v) => {
+    state.brush.opacity = v;
+    pushBrush();
+  },
+});
+state.on("brush", () => {
+  sizeGauge.paint();
+  opacityGauge.paint();
+  shell.buttons.eraser!.classList.toggle("on", Boolean(state.brush.eraser));
+  shell.buttons.brush!.classList.toggle("on", !state.brush.eraser);
+  if (shell.panelOpen() === "brush") shell.rerender();
+});
+
+// ---- 修飾ボタン ----
+mods.bind(document.getElementById("modShift")!, "shift", "SHF", shell.toast);
+mods.bind(document.getElementById("modCtrl")!, "ctrl", "CTL", shell.toast);
+mods.bind(document.getElementById("modAlt")!, "alt", "ALT", shell.toast);
+mods.bind(document.getElementById("modF")!, "f", "F", shell.toast);
+mods.listeners.add(() => {
+  // F は押した瞬間に全体表示(押している間の矩形選択はフェーズ 4)
+});
+document.getElementById("modF")!.addEventListener("click", () => input.fit());
+const delBtn = document.getElementById("modDel")!;
+attachRadialButton(
+  delBtn,
+  () => ({
+    N: { label: "レイヤーを消去", icon: ICONS.clear, run: () => bridge.send({ type: "clear" }) },
+    S: {
+      label: "レイヤーを削除",
+      icon: ICONS.trash,
+      run: () => bridge.send({ type: "layerOp", op: "remove", id: state.active }),
+    },
+  }),
+  () => bridge.send({ type: "clear" })
 );
 
-// ---- HUD ----
-let ready = { version: "", renderer: "", desynchronized: false };
-let last: Stats | null = null;
+// ---- 色見本 ----
+function paintSwatch(): void {
+  const b = shell.buttons.color!;
+  (b.querySelector(".swatch-main") as HTMLElement).style.background = rgbToHex(state.color);
+  (b.querySelector(".swatch-sub") as HTMLElement).style.background = rgbToHex(state.sub);
+  if (shell.panelOpen() === "color") shell.rerender();
+}
+state.on("color", paintSwatch);
+paintSwatch();
+
+// ---- レイヤー ----
+let thumbTimer = 0;
+function requestThumbnails(): void {
+  if (thumbTimer) return;
+  thumbTimer = setTimeout(() => {
+    thumbTimer = 0;
+    bridge.send({ type: "thumbnails", size: 56 });
+  }, 150) as unknown as number;
+}
+function applyLayers(layers: LayerInfo[], active: number): void {
+  state.layers = layers;
+  state.active = active;
+  state.emit("layers");
+  if (shell.panelOpen() === "layers") shell.rerender();
+}
+bridge.on("layers", (m) => applyLayers(m.layers, m.active));
+bridge.on("thumbnails", (m) => {
+  setThumbnails(m.size, m.items);
+  if (shell.panelOpen() === "layers") shell.rerender();
+});
+
+// ---- ワーカーからの知らせ ----
+bridge.on("ready", (m) => {
+  state.ready = { version: m.version, renderer: m.renderer, desynchronized: m.desynchronized, restored: m.restored };
+  state.presets = m.presets;
+  const last = state.presetByName(state.settings.lastBrush) ?? state.presets[1] ?? state.presets[0];
+  if (last) {
+    state.brush = JSON.parse(last.json) as BrushJson;
+    pushBrush();
+  }
+  state.docW = m.docW;
+  state.docH = m.docH;
+  input.fit();
+  applyLayers(m.layers, m.active);
+  if (m.restored) shell.toast("前回の続きから");
+  renderHud();
+});
+bridge.on("doc", (m) => {
+  state.docW = m.docW;
+  state.docH = m.docH;
+  input.fit();
+  applyLayers(m.layers, m.active);
+});
+bridge.on("stats", (m) => {
+  state.stats = m.stats;
+  if (m.stats.dabs > 0) {
+    frameHist.push(m.stats.frameMs);
+    if (frameHist.length > 120) frameHist.shift();
+  }
+  shell.buttons.undo!.disabled = !m.stats.canUndo;
+  shell.buttons.redo!.disabled = !m.stats.canRedo;
+  renderHud();
+  if (shell.panelOpen() === "layers" && m.stats.bakeMs > 0) requestThumbnails();
+});
+bridge.on("png", (m) => download(m.blob, `imagine-${Date.now()}.png`));
+bridge.on("file", (m) => download(new Blob([m.bytes], { type: "application/zip" }), `imagine-${Date.now()}.imst`));
+
+// ---- HUD(計測) ----
 const frameHist: number[] = [];
 const mb = (n: number) => (n / 1048576).toFixed(1);
-
 function renderHud(): void {
+  hud.hidden = !state.settings.hud;
+  if (hud.hidden) return;
+  const s = state.stats;
+  const st = input.stats;
   const avg = frameHist.length ? frameHist.reduce((a, b) => a + b, 0) / frameHist.length : 0;
   const max = frameHist.length ? Math.max(...frameHist) : 0;
   hud.textContent = [
-    `Imagine Studio · Phase 2 · ${__BUILD__}`,
-    `wasm ${ready.version}  ${ready.renderer.slice(0, 40)}`,
-    `desync ${ready.desynchronized ? "on" : "off"}  raw ${hasRawUpdate ? "on" : "off"}  predict ${hasPredicted ? "on" : "off"}  dpr ${dpr}`,
-    `doc ${DOC_W}×${DOC_H}  zoom ${(view.scale * 100).toFixed(0)}%  rot ${((view.rot * 180) / Math.PI).toFixed(0)}°`,
-    `pointer ${inputStats.pointerType}  p ${inputStats.pressure.toFixed(2)}  tilt ${inputStats.tiltX},${inputStats.tiltY}`,
-    `events/frame ${inputStats.eventsPerFrame}  coalesced ${inputStats.coalesced}`,
-    `frame ${last ? last.frameMs.toFixed(2) : "-"} ms  avg ${avg.toFixed(2)}  max ${max.toFixed(2)}`,
-    `input→draw ${last ? last.inputToDrawMs.toFixed(1) : "-"} ms  draws ${last?.drawCalls ?? "-"}  bake ${last ? last.bakeMs.toFixed(1) : "-"} ms`,
-    `dabs/frame ${last?.dabs ?? "-"}  stroke dabs ${last?.strokeDabs ?? "-"}`,
-    `tiles ${last?.tiles ?? "-"}  pixels ${last ? mb(last.memoryBytes) : "-"} MB  history ${last ? mb(last.historyBytes) : "-"} MB`,
+    `Imagine Studio · Phase 3 · ${__BUILD__}`,
+    `wasm ${state.ready.version}  ${state.ready.renderer.slice(0, 40)}`,
+    `desync ${state.ready.desynchronized ? "on" : "off"}  raw ${input.hasRawUpdate ? "on" : "off"}  predict ${input.hasPredicted ? "on" : "off"}  dpr ${input.dpr}`,
+    `doc ${state.docW}×${state.docH}  zoom ${(state.view.scale * 100).toFixed(0)}%  rot ${((state.view.rot * 180) / Math.PI).toFixed(0)}°`,
+    `pointer ${st.pointerType}  p ${st.pressure.toFixed(2)}  tilt ${st.tiltX},${st.tiltY}`,
+    `events/frame ${st.eventsPerFrame}  coalesced ${st.coalesced}`,
+    `frame ${s ? s.frameMs.toFixed(2) : "-"} ms  avg ${avg.toFixed(2)}  max ${max.toFixed(2)}`,
+    `input→draw ${s ? s.inputToDrawMs.toFixed(1) : "-"} ms  draws ${s?.drawCalls ?? "-"}  bake ${s ? s.bakeMs.toFixed(1) : "-"} ms`,
+    `dabs/frame ${s?.dabs ?? "-"}  stroke dabs ${s?.strokeDabs ?? "-"}`,
+    `tiles ${s?.tiles ?? "-"}  pixels ${s ? mb(s.memoryBytes) : "-"} MB  history ${s ? mb(s.historyBytes) : "-"} MB`,
   ].join("\n");
 }
-
-const readbacks = new Map<number, (n: number) => void>();
-let readbackId = 0;
-
-worker.onmessage = (e: MessageEvent<FromWorker>) => {
-  const m = e.data;
-  switch (m.type) {
-    case "ready":
-      ready = m;
-      applyPresets(m.presets);
-      applyLayers(m.layers, m.active);
-      if (m.docW !== DOC_W || m.docH !== DOC_H) setDocSize(m.docW, m.docH);
-      renderHud();
-      break;
-    case "doc":
-      applyLayers(m.layers, m.active);
-      setDocSize(m.docW, m.docH);
-      renderHud();
-      break;
-    case "layers":
-      applyLayers(m.layers, m.active);
-      break;
-    case "file":
-      download(new Blob([m.bytes], { type: "application/zip" }), `imagine-${Date.now()}.imst`);
-      break;
-    case "stats":
-      last = m.stats;
-      if (m.stats.dabs > 0) {
-        frameHist.push(m.stats.frameMs);
-        if (frameHist.length > 120) frameHist.shift();
-      }
-      renderHud();
-      break;
-    case "png":
-      download(m.blob, `imagine-${Date.now()}.png`);
-      break;
-    case "readback":
-      readbacks.get(m.id)?.(m.painted);
-      readbacks.delete(m.id);
-      break;
-    case "error":
-      showError(m.message);
-      break;
-  }
-};
-worker.onerror = (e) => showError(String(e.message ?? e));
+state.on("settings", renderHud);
+state.on("view", renderHud);
 renderHud();
+
+// ---- キーボード(Windows) ----
+window.addEventListener("keydown", (e) => {
+  if ((e.target as HTMLElement)?.tagName === "TEXTAREA" || (e.target as HTMLElement)?.tagName === "INPUT") return;
+  const k = e.key.toLowerCase();
+  if ((e.ctrlKey || e.metaKey) && k === "z") {
+    e.preventDefault();
+    if (e.shiftKey) ctx.act.redo();
+    else ctx.act.undo();
+  } else if ((e.ctrlKey || e.metaKey) && k === "y") {
+    e.preventDefault();
+    ctx.act.redo();
+  } else if (k === "b" && !state.brush.eraser) {
+    panels.brush!();
+  } else if (k === "e") {
+    toggleEraser();
+  } else if (k === "x") {
+    swapColors();
+  } else if (k === "[" || k === "]") {
+    const v = Number(state.brush.size);
+    state.brush.size = Math.max(0.5, k === "[" ? v / 1.2 : v * 1.2);
+    pushBrush();
+  } else if (k === "0") {
+    input.fit();
+  }
+});
 
 // ---- テストと計測のための入口 ----
 declare global {
@@ -510,21 +407,37 @@ declare global {
     __imagine: {
       readback(): Promise<number>;
       stats(): Stats | null;
-      ready(): typeof ready;
-      view(): View;
+      ready(): typeof state.ready;
+      view(): typeof state.view;
+      setBrush(name: string): boolean;
+      setColor(hex: string): void;
+      undo(): void;
+      presets(): string[];
+      layers(): LayerInfo[];
+      send(m: unknown): void;
     };
   }
 }
+let readbackId = 0;
 window.__imagine = {
   readback: () =>
-    new Promise<number>((resolve) => {
-      const id = ++readbackId;
-      readbacks.set(id, resolve);
-      send({ type: "readback", id });
-    }),
-  stats: () => last,
-  ready: () => ready,
-  view: () => view,
+    bridge.request((id) => ({ type: "readback", id: id + ++readbackId * 0 }), "readback").then((m) => m.painted),
+  stats: () => state.stats,
+  ready: () => state.ready,
+  view: () => state.view,
+  setBrush: (name) => {
+    const p = state.presetByName(name);
+    if (p) setBrush(p);
+    return Boolean(p);
+  },
+  setColor: (hex) => {
+    const c = hexToRgb(hex);
+    if (c) setColor(c, true);
+  },
+  undo: () => ctx.act.undo(),
+  presets: () => state.presets.map((p) => p.name),
+  layers: () => state.layers,
+  send: (m) => bridge.send(m as never),
 };
 
 // ---- PWA ----

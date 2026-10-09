@@ -50,6 +50,7 @@ export interface LayerInfo {
   name: string;
   visible: boolean;
   a8: boolean;
+  opacity: number;
 }
 
 export type ToWorker =
@@ -72,6 +73,12 @@ export type ToWorker =
   | { type: "setLayer"; id: number }
   | { type: "addLayer"; a8: boolean; name: string }
   | { type: "setLayerVisible"; id: number; visible: boolean }
+  | { type: "layerOp"; op: "remove" | "duplicate" | "mergeDown" | "moveUp" | "moveDown"; id: number }
+  | { type: "renameLayer"; id: number; name: string }
+  | { type: "setLayerOpacity"; id: number; opacity: number }
+  | { type: "thumbnails"; size: number }
+  | { type: "sample"; id: number; x: number; y: number }
+  | { type: "line"; x0: number; y0: number; x1: number; y1: number; pressure: number; commit: boolean }
   | { type: "clear" }
   | { type: "undo" }
   | { type: "redo" }
@@ -120,5 +127,7 @@ export type FromWorker =
   | { type: "stats"; stats: Stats }
   | { type: "png"; id: number; blob: Blob }
   | { type: "file"; id: number; bytes: ArrayBuffer }
+  | { type: "thumbnails"; size: number; items: Array<{ id: number; bitmap: ImageBitmap }> }
+  | { type: "sample"; id: number; rgb: [number, number, number]; alpha: number }
   | { type: "readback"; id: number; painted: number }
   | { type: "error"; message: string };

@@ -11,6 +11,7 @@ const root = resolve(new URL("../apps/web/dist", import.meta.url).pathname);
 const types = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript",
+  ".css": "text/css",
   ".wasm": "application/wasm",
   ".webmanifest": "application/manifest+json",
   ".svg": "image/svg+xml",
@@ -46,15 +47,12 @@ try {
   await page.mouse.wheel(0, -600);
   await page.waitForTimeout(100);
 
-  const presets = await page.$$eval("#preset option", (os) => os.map((o) => o.textContent));
+  const presets = await page.evaluate(() => window.__imagine.presets());
   const colors = ["#c0392b", "#2980b9", "#27ae60", "#8e44ad", "#d35400", "#16a085", "#2c3e50", "#7f8c8d"];
   let y = 90;
   for (let i = 0; i < presets.length; i++) {
-    await page.selectOption("#preset", String(i));
-    await page.$eval("#color", (el, v) => {
-      el.value = v;
-      el.dispatchEvent(new Event("input"));
-    }, colors[i % colors.length]);
+    await page.evaluate((n) => window.__imagine.setBrush(n), presets[i]);
+    await page.evaluate((v) => window.__imagine.setColor(v), colors[i % colors.length]);
     await page.waitForTimeout(50);
     // 筆圧を変えながら S 字を描く(mouse は筆圧 1 固定なので、太さは速度と入り抜きで変わる)
     await page.mouse.move(120, y);
@@ -68,10 +66,7 @@ try {
     await page.waitForTimeout(150);
     // 混色を見るために、同じ場所に別の色をもう 1 本重ねる
     if (presets[i] === "水彩" || presets[i] === "油彩") {
-      await page.$eval("#color", (el) => {
-        el.value = "#f1c40f";
-        el.dispatchEvent(new Event("input"));
-      });
+      await page.evaluate(() => window.__imagine.setColor("#f1c40f"));
       await page.waitForTimeout(50);
       await page.mouse.move(300, y - 20);
       await page.mouse.down();

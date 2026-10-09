@@ -114,6 +114,51 @@ impl Doc {
         self.inner.layer(id).map_or(1.0, |l| l.opacity)
     }
 
+    pub fn set_layer_name(&mut self, id: u32, name: &str) {
+        self.inner.set_layer_name(id, name);
+    }
+    pub fn remove_layer(&mut self, id: u32) -> bool {
+        self.inner.remove_layer(id)
+    }
+    /// 複製して元のすぐ上に置く。新しい id(失敗は 0)。
+    pub fn duplicate_layer(&mut self, id: u32) -> u32 {
+        self.inner.duplicate_layer(id).unwrap_or(0)
+    }
+    pub fn move_layer(&mut self, id: u32, to: u32) -> bool {
+        self.inner.move_layer(id, to as usize)
+    }
+    /// 下へ結合。戻り値は [下のレイヤー id, tx, ty, ...]。失敗は長さ 0。
+    pub fn merge_down(&mut self, id: u32) -> js_sys::Int32Array {
+        match self.inner.merge_down(id) {
+            Some((lower, keys)) => {
+                let mut v = vec![lower as i32];
+                for k in keys {
+                    v.push(k.tx);
+                    v.push(k.ty);
+                }
+                js_sys::Int32Array::from(v.as_slice())
+            }
+            None => js_sys::Int32Array::new_with_length(0),
+        }
+    }
+    /// 縮小見本(プリマルチ RGBA8、tw × th)。
+    pub fn thumbnail(&self, id: u32, tw: u32, th: u32) -> js_sys::Uint8Array {
+        match self.inner.layer(id) {
+            Some(l) => js_sys::Uint8Array::from(l.cel.thumbnail(tw, th).as_slice()),
+            None => js_sys::Uint8Array::new_with_length(0),
+        }
+    }
+    /// 1 画素の見えている色 [r, g, b, 絵の具の濃さ](0..1)。スポイト用。
+    pub fn sample(&self, x: i32, y: i32) -> js_sys::Float32Array {
+        let n = self.inner.layers().len();
+        let c = if n == 0 {
+            [1.0, 1.0, 1.0, 0.0]
+        } else {
+            self.inner.sample_over_white(n - 1, x, y)
+        };
+        js_sys::Float32Array::from(&c[..])
+    }
+
     /// GPU で描いたストロークバッファの矩形(プリマルチ RGBA8)を焼く。戻り値は変わったタイル [tx, ty, ...]。
     #[allow(clippy::too_many_arguments)]
     pub fn composite_stroke(

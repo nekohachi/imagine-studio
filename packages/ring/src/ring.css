@@ -1,0 +1,119 @@
+/* 輪(radial)、修飾ボタン、縦ゲージの見た目。macbeth の shell.css から該当部分を移植 */
+
+.radial {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  touch-action: none;
+}
+.radial svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.radial text {
+  font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
+  font-size: 13px;
+  fill: #dfe5ea;
+  pointer-events: none;
+}
+.radial .sub {
+  font-size: 10px;
+  fill: #93a0ab;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .radial {
+    animation: ring-pop 0.09s ease-out;
+  }
+}
+@keyframes ring-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* 修飾ボタン */
+.mod {
+  width: 48px;
+  height: 44px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(28, 28, 34, 0.86);
+  color: #c8ced6;
+  font: 600 12px/1 ui-monospace, Menlo, monospace;
+  letter-spacing: 0.04em;
+  display: grid;
+  place-items: center;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  backdrop-filter: blur(6px);
+}
+.mod[data-state="held"] {
+  background: #2f5f7d;
+  color: #fff;
+  border-color: #4f9fd1;
+}
+.mod[data-state="on"] {
+  background: #4f9fd1;
+  color: #0e141a;
+  border-color: #4f9fd1;
+}
+.mod[data-state="on"]::after {
+  content: "";
+  position: absolute;
+  right: 4px;
+  top: 4px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #0e141a;
+}
+.mod {
+  position: relative;
+}
+
+/* 縦ゲージ */
+.gauge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.gauge-label,
+.gauge-value {
+  font: 10px/1 ui-monospace, Menlo, monospace;
+  color: #93a0ab;
+}
+.gauge-track {
+  position: relative;
+  width: 14px;
+  height: 120px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+.gauge .fill {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(180deg, #4f9fd1 0%, #2f5f7d 100%);
+}
+.gauge .knob {
+  position: absolute;
+  left: -1px;
+  right: -1px;
+  height: 3px;
+  background: #dfe8ef;
+}

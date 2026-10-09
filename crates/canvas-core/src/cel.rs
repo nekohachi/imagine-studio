@@ -163,6 +163,50 @@ impl Cel {
         out
     }
 
+    /// 縮小見本(プリマルチ RGBA8、tw × th)。各出力画素は対応する元の区画を最大 8×8 点で平均する
+    /// (細い線が抜けないように)。A8 は黒インクとして出す。レイヤーパネルのサムネイル用。
+    pub fn thumbnail(&self, tw: u32, th: u32) -> Vec<u8> {
+        let tw = tw.max(1) as usize;
+        let th = th.max(1) as usize;
+        let mut out = vec![0u8; tw * th * 4];
+        let sx = self.width as f32 / tw as f32;
+        let sy = self.height as f32 / th as f32;
+        let nx = (sx as usize).clamp(1, 8);
+        let ny = (sy as usize).clamp(1, 8);
+        let bpp = self.format.bytes_per_pixel();
+        for oy in 0..th {
+            for ox in 0..tw {
+                let mut acc = [0u32; 4];
+                let mut n = 0u32;
+                for j in 0..ny {
+                    let y = ((oy as f32 + (j as f32 + 0.5) / ny as f32) * sy) as i32;
+                    for i in 0..nx {
+                        let x = ((ox as f32 + (i as f32 + 0.5) / nx as f32) * sx) as i32;
+                        n += 1;
+                        let key = TileKey::new(x.div_euclid(TILE as i32), y.div_euclid(TILE as i32));
+                        let Some(t) = self.tiles.get(&key) else { continue };
+                        let lx = x.rem_euclid(TILE as i32) as usize;
+                        let ly = y.rem_euclid(TILE as i32) as usize;
+                        let p = (ly * TILE + lx) * bpp;
+                        match self.format {
+                            PixelFormat::Rgba8 => {
+                                for c in 0..4 {
+                                    acc[c] += t.data[p + c] as u32;
+                                }
+                            }
+                            PixelFormat::A8 => acc[3] += t.data[p] as u32,
+                        }
+                    }
+                }
+                let o = (oy * tw + ox) * 4;
+                for c in 0..4 {
+                    out[o + c] = (acc[c] / n.max(1)) as u8;
+                }
+            }
+        }
+        out
+    }
+
     /// 矩形の画素を自分の形式で上書きする(読み込みや貼り付け用)。
     pub fn write_rect(&mut self, rect: Rect, src: &[u8]) -> Snapshot {
         let rect_in = rect.intersect(&self.bounds());

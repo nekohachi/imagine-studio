@@ -477,7 +477,14 @@ export class Renderer {
   }
 
   /** 画面へ: 外側は灰、紙は白、下まとめ + 編集中(+ ストローク + 予測)+ 上まとめ。 */
-  present(view: View, strokeOpacity: number, showStroke: boolean, showPredict: boolean): void {
+  present(
+    view: View,
+    strokeOpacity: number,
+    showStroke: boolean,
+    showPredict: boolean,
+    activeOpacity = 1,
+    activeVisible = true
+  ): void {
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, this.viewW, this.viewH);
@@ -486,9 +493,11 @@ export class Renderer {
     const m = presentMatrix(view, this.viewW, this.viewH);
     this.blit(null, null, m, 1, false, 2, [1, 1, 1, 1]);
     this.blit(this.below, null, m, 1, true, 0);
-    this.blit(this.active, null, m, 1, true, this.active?.a8 ? 1 : 0);
-    if (showStroke) this.blit(this.stroke, null, m, strokeOpacity, true, 0);
-    if (showPredict) this.blit(this.predict, null, m, strokeOpacity, false, 0);
+    if (activeVisible) {
+      this.blit(this.active, null, m, activeOpacity, true, this.active?.a8 ? 1 : 0);
+      if (showStroke) this.blit(this.stroke, null, m, strokeOpacity * activeOpacity, true, 0);
+      if (showPredict) this.blit(this.predict, null, m, strokeOpacity * activeOpacity, false, 0);
+    }
     this.blit(this.above, null, m, 1, true, 0);
   }
 

@@ -76,6 +76,7 @@ function layerInfos(): LayerInfo[] {
     name: doc!.layer_name(id),
     visible: doc!.layer_visible(id),
     a8: doc!.layer_format(id) === 1,
+    opacity: doc!.layer_opacity(id),
   }));
 }
 
@@ -129,7 +130,9 @@ function rebuildMerged(): void {
 }
 
 function present(showStroke = false, showPredict = false): void {
-  renderer?.present(view, brushOpacity(), showStroke, showPredict);
+  const op = doc ? doc.layer_opacity(active) : 1;
+  const vis = doc ? doc.layer_visible(active) : true;
+  renderer?.present(view, brushOpacity(), showStroke, showPredict, op, vis);
 }
 
 // ---- 自動保存(変更から 2 秒後、連続する変更はまとめる) ----
@@ -413,6 +416,128 @@ async function handle(m: ToWorker): Promise<void> {
         scheduleAutosave();
       }
       post({ type: "stats", stats: stats(performance.now(), 0, 0) });
+      return;
+    }
+    case "layerOp": {
+      if (!doc || !renderer) return;
+      const ids = Array.from(doc.layer_ids());
+      const idx = ids.indexOf(m.id);
+      if (idx < 0) return;
+      let ok = true;
+      switch (m.op) {
+        case "remove":
+          ok = doc.remove_layer(m.id);
+          if (ok && active === m.id) active = Array.from(doc.layer_ids())[Math.max(0, idx - 1)]!;
+          break;
+        case "duplicate": {
+          const nid = doc.duplicate_layer(m.id);
+          if (nid) active = nid;
+          else ok = false;
+          break;
+        }
+        case "mergeDown": {
+          const r = doc.merge_down(m.id);
+          if (r.length) {
+            if (active === m.id) active = r[0]!;
+          } else ok = false;
+          break;
+        }
+        case "moveUp":
+          ok = doc.move_layer(m.id, idx + 1);
+          break;
+        case "moveDown":
+          ok = idx > 0 && doc.move_layer(m.id, idx - 1);
+          break;
+      }
+      if (ok) {
+        uploadActiveAll();
+        rebuildMerged();
+        present();
+        scheduleAutosave();
+      }
+      post({ type: "layers", layers: layerInfos(), active });
+      post({ type: "stats", stats: stats(performance.now(), 0, 0) });
+      return;
+    }
+    case "renameLayer":
+      doc?.set_layer_name(m.id, m.name);
+      scheduleAutosave();
+      post({ type: "layers", layers: layerInfos(), active });
+      return;
+    case "setLayerOpacity": {
+      if (!doc) return;
+      doc.set_layer_opacity(m.id, m.opacity);
+      if (m.id !== active) rebuildMerged();
+      present();
+      scheduleAutosave();
+      post({ type: "layers", layers: layerInfos(), active });
+      return;
+    }
+    case "thumbnails": {
+      if (!doc) return;
+      const size = Math.max(16, Math.min(256, m.size | 0));
+      const w = doc.width;
+      const h = doc.height;
+      const tw = w >= h ? size : Math.max(1, Math.round((size * w) / h));
+      const th = w >= h ? Math.max(1, Math.round((size * h) / w)) : size;
+      const items: Array<{ id: number; bitmap: ImageBitmap }> = [];
+      const c = new OffscreenCanvas(tw, th);
+      const ctx = c.getContext("2d")!;
+      for (const id of Array.from(doc.layer_ids())) {
+        const pre = doc.thumbnail(id, tw, th);
+        const out = new Uint8ClampedArray(pre.length);
+        for (let i = 0; i < pre.length; i += 4) {
+          const a = pre[i + 3]!;
+          if (a === 0) continue;
+          out[i] = Math.min(255, Math.round((pre[i]! * 255) / a));
+          out[i + 1] = Math.min(255, Math.round((pre[i + 1]! * 255) / a));
+          out[i + 2] = Math.min(255, Math.round((pre[i + 2]! * 255) / a));
+          out[i + 3] = a;
+        }
+        ctx.clearRect(0, 0, tw, th);
+        ctx.putImageData(new ImageData(out, tw, th), 0, 0);
+        items.push({ id, bitmap: c.transferToImageBitmap() });
+      }
+      post({ type: "thumbnails", size, items }, items.map((i) => i.bitmap));
+      return;
+    }
+    case "sample": {
+      if (!doc) return;
+      const c = doc.sample(Math.round(m.x), Math.round(m.y));
+      post({ type: "sample", id: m.id, rgb: [c[0]!, c[1]!, c[2]!], alpha: c[3]! });
+      return;
+    }
+    case "line": {
+      // 直線(SHF)。毎回ストロークを作り直して 2 点だけ流す。commit で焼く
+      if (!renderer || !brush || !doc) return;
+      if (stroke) {
+        stroke.free();
+        stroke = null;
+      }
+      renderer.beginStroke();
+      bbox = null;
+      const s = new Stroke(brush, colorRgb[0], colorRgb[1], colorRgb[2]);
+      const pts = Float32Array.from([m.x0, m.y0, m.pressure, 0, 0, 0, m.x1, m.y1, m.pressure, 16, 0, 0]);
+      const a = s.add_points(pts, doc, active);
+      const b = s.finish(doc, active);
+      s.free();
+      for (const d of [a, b]) {
+        if (d.length) {
+          renderer.drawDabs(d, look());
+          growBbox(d);
+        }
+      }
+      if (m.commit) {
+        bake();
+        bbox = null;
+        renderer.endStroke();
+        present();
+        scheduleAutosave();
+        post({ type: "stats", stats: stats(performance.now(), 0, 0) });
+      } else {
+        renderer.drawPredicted(new Float32Array(0), look());
+        present(true, false);
+      }
       return;
     }
     case "exportPng":
