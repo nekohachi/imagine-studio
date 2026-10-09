@@ -77,6 +77,8 @@ function layerInfos(): LayerInfo[] {
     visible: doc!.layer_visible(id),
     a8: doc!.layer_format(id) === 1,
     opacity: doc!.layer_opacity(id),
+    blend: doc!.layer_blend(id),
+    clip: doc!.layer_clip(id),
   }));
 }
 
@@ -125,14 +127,20 @@ function rebuildMerged(): void {
   const n = doc.layer_ids().length;
   const w = doc.width;
   const h = doc.height;
-  renderer.uploadMerged("below", doc.flatten_range(0, Math.max(idx, 0), 0, 0, w, h));
+  // 下は紙の上で不透明に(合成モードが紙の上で正しく見える)。上は透明の上に
+  renderer.uploadMerged("below", doc.flatten_range_on_white(0, Math.max(idx, 0), 0, 0, w, h));
   renderer.uploadMerged("above", doc.flatten_range(idx + 1, n, 0, 0, w, h));
+  // 編集中レイヤーがクリッピングなら、土台のアルファを GPU へ
+  const base = doc.clip_base(active);
+  renderer.uploadClip(base ? doc.layer_alpha(base) : null);
 }
 
 function present(showStroke = false, showPredict = false): void {
   const op = doc ? doc.layer_opacity(active) : 1;
   const vis = doc ? doc.layer_visible(active) : true;
-  renderer?.present(view, brushOpacity(), showStroke, showPredict, op, vis);
+  const mode = doc ? doc.layer_blend(active) : 0;
+  const clip = doc ? doc.layer_clip(active) && doc.clip_base(active) !== 0 : false;
+  renderer?.present(view, brushOpacity(), showStroke, showPredict, op, vis, mode, clip);
 }
 
 // ---- 自動保存(変更から 2 秒後、連続する変更はまとめる) ----
@@ -285,6 +293,7 @@ async function handle(m: ToWorker): Promise<void> {
         docH: doc!.height,
         restored,
         presets: presets(),
+        blendNames: Array.from(Doc.blend_names()) as string[],
       });
       post({ type: "stats", stats: stats(performance.now(), 0, 0) });
       return;
@@ -468,6 +477,24 @@ async function handle(m: ToWorker): Promise<void> {
       if (!doc) return;
       doc.set_layer_opacity(m.id, m.opacity);
       if (m.id !== active) rebuildMerged();
+      present();
+      scheduleAutosave();
+      post({ type: "layers", layers: layerInfos(), active });
+      return;
+    }
+    case "setLayerBlend": {
+      if (!doc) return;
+      doc.set_layer_blend(m.id, m.blend);
+      if (m.id !== active) rebuildMerged();
+      present();
+      scheduleAutosave();
+      post({ type: "layers", layers: layerInfos(), active });
+      return;
+    }
+    case "setLayerClip": {
+      if (!doc) return;
+      doc.set_layer_clip(m.id, m.clip);
+      rebuildMerged();
       present();
       scheduleAutosave();
       post({ type: "layers", layers: layerInfos(), active });

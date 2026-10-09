@@ -316,6 +316,7 @@ bridge.on("thumbnails", (m) => {
 bridge.on("ready", (m) => {
   state.ready = { version: m.version, renderer: m.renderer, desynchronized: m.desynchronized, restored: m.restored };
   state.presets = m.presets;
+  state.blendNames = m.blendNames;
   const last = state.presetByName(state.settings.lastBrush) ?? state.presets[1] ?? state.presets[0];
   if (last) {
     state.brush = JSON.parse(last.json) as BrushJson;

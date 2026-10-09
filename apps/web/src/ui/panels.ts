@@ -194,7 +194,10 @@ export function renderLayersPanel(body: HTMLElement, ctx: Ctx): void {
     if (bm) g.drawImage(bm, (thumbSize - bm.width) / 2, (thumbSize - bm.height) / 2);
     const name = document.createElement("span");
     name.className = "lyname";
-    name.textContent = l.name + (l.a8 ? "(モノクロ)" : "");
+    const modeName = BLEND_LABELS[state.blendNames[l.blend] ?? "normal"] ?? state.blendNames[l.blend];
+    name.innerHTML =
+      `<span>${l.clip ? "↳ " : ""}${l.name}${l.a8 ? "(モノクロ)" : ""}</span>` +
+      `<span class="lysub">${l.blend ? modeName : ""}${l.opacity < 1 ? ` ${Math.round(l.opacity * 100)}%` : ""}</span>`;
     const eye = document.createElement("button");
     eye.className = "lyeye";
     eye.innerHTML = svgIcon(l.visible ? "eye" : "eyeOff", 18);
@@ -203,7 +206,12 @@ export function renderLayersPanel(body: HTMLElement, ctx: Ctx): void {
       bridge.send({ type: "setLayerVisible", id: l.id, visible: !l.visible });
     });
     row.append(c, name, eye);
-    attachRadialButton(row, () => layerMenu(ctx, l), () => act.setLayer(l.id));
+    attachRadialButton(
+      row,
+      () => layerMenu(ctx, l),
+      () => act.setLayer(l.id),
+      () => layerMenuList(ctx, l)
+    );
     list.appendChild(row);
   }
   body.append(list);
@@ -219,13 +227,48 @@ export function renderLayersPanel(body: HTMLElement, ctx: Ctx): void {
   act.thumbnails();
 }
 
+/** 合成モードの表示名(Photoshop / CLIP STUDIO の呼び方)。 */
+export const BLEND_LABELS: Record<string, string> = {
+  normal: "通常",
+  multiply: "乗算",
+  screen: "スクリーン",
+  overlay: "オーバーレイ",
+  darken: "比較(暗)",
+  lighten: "比較(明)",
+  add: "加算(発光)",
+  subtract: "減算",
+  difference: "差の絶対値",
+  soft_light: "ソフトライト",
+  hard_light: "ハードライト",
+  color_dodge: "覆い焼きカラー",
+  color_burn: "焼き込みカラー",
+  hue: "色相",
+  saturation: "彩度",
+  color: "カラー",
+  luminosity: "輝度",
+};
+
+/** レイヤー行の長押しの輪の下に並べる: 合成モードの一覧。 */
+export function layerMenuList(ctx: Ctx, l: LayerInfo): RadialItem[] {
+  return ctx.state.blendNames.map((n, i) => ({
+    label: BLEND_LABELS[n] ?? n,
+    sub: i === l.blend ? "いま" : undefined,
+    run: () => ctx.bridge.send({ type: "setLayerBlend", id: l.id, blend: i }),
+  }));
+}
+
 function layerMenu(ctx: Ctx, l: LayerInfo): RadialMenu {
   const { bridge, state, shell } = ctx;
   const op = (op: "remove" | "duplicate" | "mergeDown" | "moveUp" | "moveDown") => () =>
     bridge.send({ type: "layerOp", op, id: l.id });
   return {
     N: { label: "複製", icon: ICONS.copy, run: op("duplicate") },
-    NE: { label: "上へ", icon: ICONS.up, run: op("moveUp") },
+    NE: {
+      label: l.clip ? "クリップ解除" : "クリッピング",
+      sub: "下のレイヤーで",
+      icon: ICONS.down,
+      run: () => bridge.send({ type: "setLayerClip", id: l.id, clip: !l.clip }),
+    },
     E: { label: "下と結合", icon: ICONS.merge, run: op("mergeDown") },
     SE: { label: "下へ", icon: ICONS.down, run: op("moveDown") },
     S: {
@@ -247,11 +290,7 @@ function layerMenu(ctx: Ctx, l: LayerInfo): RadialMenu {
         if (n) bridge.send({ type: "renameLayer", id: l.id, name: n });
       },
     },
-    NW: {
-      label: l.visible ? "非表示" : "表示",
-      icon: ICONS.eye,
-      run: () => bridge.send({ type: "setLayerVisible", id: l.id, visible: !l.visible }),
-    },
+    NW: { label: "上へ", icon: ICONS.up, run: op("moveUp") },
     SW: {
       label: "消去",
       sub: "このレイヤー",

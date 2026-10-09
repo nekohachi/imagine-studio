@@ -132,6 +132,101 @@ void main() {
   o = c;
 }`;
 
+// 編集中レイヤーを、下まとめ(紙の上、不透明)に合成モードで重ねる。画面空間で 1 回。
+// ストロークバッファと予測はレイヤーの一部として先に src-over し、クリップは土台のアルファで絞る。
+const COMPOSE_VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec2 corner;     // 0..1
+uniform vec2 uViewSize;                // 画面 px
+uniform vec2 uDocSize;                 // doc px
+uniform mat3 uInv;                     // 画面 px(y 下向き) → doc px
+out vec2 vUv;
+out vec2 vDocUv;
+void main() {
+  vUv = corner;
+  vec2 screen = vec2(corner.x * uViewSize.x, (1.0 - corner.y) * uViewSize.y);
+  vec3 d = uInv * vec3(screen, 1.0);
+  vDocUv = d.xy / uDocSize;
+  gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const COMPOSE_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+in vec2 vDocUv;
+uniform sampler2D uBack;
+uniform sampler2D uActive;
+uniform sampler2D uStroke;
+uniform sampler2D uPredict;
+uniform sampler2D uClip;
+uniform int uMode;
+uniform float uOpacity;
+uniform float uStrokeOp;
+uniform int uActiveA8;
+uniform int uHasClip;
+uniform int uShowStroke;
+uniform int uShowPredict;
+out vec4 o;
+
+float lum(vec3 c) { return dot(c, vec3(0.3, 0.59, 0.11)); }
+vec3 clipColor(vec3 c) {
+  float l = lum(c);
+  float n = min(c.r, min(c.g, c.b));
+  float x = max(c.r, max(c.g, c.b));
+  if (n < 0.0) c = l + (c - l) * l / max(l - n, 1e-6);
+  if (x > 1.0) c = l + (c - l) * (1.0 - l) / max(x - l, 1e-6);
+  return c;
+}
+vec3 setLum(vec3 c, float l) { return clipColor(c + (l - lum(c))); }
+float sat(vec3 c) { return max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b)); }
+vec3 setSat(vec3 c, float s) {
+  float mx = max(c.r, max(c.g, c.b));
+  float mn = min(c.r, min(c.g, c.b));
+  if (mx <= mn) return vec3(0.0);
+  return (c - mn) * s / (mx - mn);
+}
+float sep(int m, float cb, float cs) {
+  if (m == 1) return cb * cs;
+  if (m == 2) return cb + cs - cb * cs;
+  if (m == 3) return cb <= 0.5 ? cs * 2.0 * cb : (cs + (2.0 * cb - 1.0) - cs * (2.0 * cb - 1.0));
+  if (m == 4) return min(cb, cs);
+  if (m == 5) return max(cb, cs);
+  if (m == 6) return min(cb + cs, 1.0);
+  if (m == 7) return max(cb - cs, 0.0);
+  if (m == 8) return abs(cb - cs);
+  if (m == 9) {
+    if (cs <= 0.5) return cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb);
+    float d = cb <= 0.25 ? ((16.0 * cb - 12.0) * cb + 4.0) * cb : sqrt(cb);
+    return cb + (2.0 * cs - 1.0) * (d - cb);
+  }
+  if (m == 10) return cs <= 0.5 ? cb * 2.0 * cs : (cb + (2.0 * cs - 1.0) - cb * (2.0 * cs - 1.0));
+  if (m == 11) return cb <= 0.0 ? 0.0 : (cs >= 1.0 ? 1.0 : min(cb / (1.0 - cs), 1.0));
+  if (m == 12) return cb >= 1.0 ? 1.0 : (cs <= 0.0 ? 0.0 : 1.0 - min((1.0 - cb) / cs, 1.0));
+  return cs;
+}
+vec3 blendRgb(int m, vec3 cb, vec3 cs) {
+  if (m == 13) return setLum(setSat(cs, sat(cb)), lum(cb));
+  if (m == 14) return setLum(setSat(cb, sat(cs)), lum(cb));
+  if (m == 15) return setLum(cs, lum(cb));
+  if (m == 16) return setLum(cb, lum(cs));
+  return vec3(sep(m, cb.r, cs.r), sep(m, cb.g, cs.g), sep(m, cb.b, cs.b));
+}
+void main() {
+  vec4 back = texture(uBack, vUv);
+  if (vDocUv.x < 0.0 || vDocUv.y < 0.0 || vDocUv.x > 1.0 || vDocUv.y > 1.0) { o = back; return; }
+  vec4 act = uActiveA8 == 1 ? vec4(0.0, 0.0, 0.0, texture(uActive, vDocUv).r) : texture(uActive, vDocUv);
+  if (uShowStroke == 1) { vec4 s = texture(uStroke, vDocUv) * uStrokeOp; act = s + act * (1.0 - s.a); }
+  if (uShowPredict == 1) { vec4 p = texture(uPredict, vDocUv) * uStrokeOp; act = p + act * (1.0 - p.a); }
+  if (uHasClip == 1) act *= texture(uClip, vDocUv).r;
+  act *= uOpacity;
+  float as = act.a;
+  if (as <= 0.0) { o = back; return; }
+  vec3 cs = act.rgb / as;
+  // 下まとめは紙の上で不透明なので αb = 1
+  vec3 b = uMode == 0 ? cs : blendRgb(uMode, back.rgb, cs);
+  o = vec4(as * b + (1.0 - as) * back.rgb, 1.0);
+}`;
+
 interface Target {
   tex: WebGLTexture;
   fbo: WebGLFramebuffer;
@@ -156,6 +251,15 @@ function fboMatrix(w: number, h: number): Mat3 {
   return mat3(2 / w, 0, 0, 2 / h, -1, -1);
 }
 
+/** 画面 px(y 下向き)→ doc px。View の逆。 */
+export function inverseView(view: View): Mat3 {
+  const c = Math.cos(view.rot) / view.scale;
+  const s = Math.sin(view.rot) / view.scale;
+  // doc = R(-rot)/scale · (screen - t)
+  // x = c·sx + s·sy - (c·tx + s·ty) ; y = -s·sx + c·sy - (-s·tx + c·ty)
+  return mat3(c, -s, s, c, -(c * view.tx + s * view.ty), -(-s * view.tx + c * view.ty));
+}
+
 /** 画面用: doc px → 画面 px(View)→ NDC(y 下向きを上向きへ)。 */
 export function presentMatrix(view: View, viewW: number, viewH: number): Mat3 {
   const c = Math.cos(view.rot) * view.scale;
@@ -175,6 +279,13 @@ export class Renderer {
   private docH = 1;
   private dabProg!: WebGLProgram;
   private blitProg!: WebGLProgram;
+  private composeProg!: WebGLProgram;
+  private c = {} as Record<string, WebGLUniformLocation>;
+  /** 画面サイズの作業用 2 枚(合成の往復) */
+  private p0: Target | null = null;
+  private p1: Target | null = null;
+  /** クリッピングの土台のアルファ(R8、doc サイズ)。無ければ null */
+  private clip: Target | null = null;
   private quadVbo!: WebGLBuffer;
   private unitVbo!: WebGLBuffer;
   private dabVbo!: WebGLBuffer;
@@ -227,6 +338,26 @@ export class Renderer {
     }
     for (const n of ["uDoc", "uM", "uTex", "uOpacity", "uDither", "uMode", "uSolid"]) {
       this.u[n] = gl.getUniformLocation(this.blitProg, n)!;
+    }
+    this.composeProg = this.program(COMPOSE_VS, COMPOSE_FS);
+    for (const n of [
+      "uViewSize",
+      "uDocSize",
+      "uInv",
+      "uBack",
+      "uActive",
+      "uStroke",
+      "uPredict",
+      "uClip",
+      "uMode",
+      "uOpacity",
+      "uStrokeOp",
+      "uActiveA8",
+      "uHasClip",
+      "uShowStroke",
+      "uShowPredict",
+    ]) {
+      this.c[n] = gl.getUniformLocation(this.composeProg, n)!;
     }
 
     this.quadVbo = gl.createBuffer()!;
@@ -314,6 +445,24 @@ export class Renderer {
     this.viewH = Math.max(1, Math.floor(viewH));
     this.gl.canvas.width = this.viewW;
     this.gl.canvas.height = this.viewH;
+    this.p0 = this.drop(this.p0);
+    this.p1 = this.drop(this.p1);
+    this.p0 = this.target(this.viewW, this.viewH, false, false);
+    this.p1 = this.target(this.viewW, this.viewH, false, false);
+  }
+
+  /** クリッピングの土台のアルファ(A8、doc 全面)。null で解除。 */
+  uploadClip(alpha: Uint8Array | null): void {
+    const gl = this.gl;
+    if (!alpha) {
+      this.clip = this.drop(this.clip);
+      return;
+    }
+    if (!this.clip) this.clip = this.target(this.docW, this.docH, true, true);
+    gl.bindTexture(gl.TEXTURE_2D, this.clip.tex);
+    gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.docW, this.docH, gl.RED, gl.UNSIGNED_BYTE, alpha);
+    gl.generateMipmap(gl.TEXTURE_2D);
   }
 
   /** ドキュメントのサイズを決めて、5 枚のテクスチャを作り直す。 */
@@ -325,6 +474,7 @@ export class Renderer {
     this.above = this.drop(this.above);
     this.stroke = this.drop(this.stroke);
     this.predict = this.drop(this.predict);
+    this.clip = this.drop(this.clip);
     this.active = this.target(this.docW, this.docH, activeA8, true);
     this.below = this.target(this.docW, this.docH, false, true);
     this.above = this.target(this.docW, this.docH, false, true);
@@ -476,29 +626,96 @@ export class Renderer {
     this.drawCalls++;
   }
 
-  /** 画面へ: 外側は灰、紙は白、下まとめ + 編集中(+ ストローク + 予測)+ 上まとめ。 */
+  /**
+   * 画面へ。
+   *   P0 = 灰の外側 + 紙の上にまとめた「下」(不透明)
+   *   P1 = P0 に編集中レイヤー(+ ストローク + 予測、クリップ、不透明度)を合成モードで重ねる
+   *   P1 += 「上」まとめ(src-over)
+   *   画面 = P1(ディザ)
+   */
   present(
     view: View,
     strokeOpacity: number,
     showStroke: boolean,
     showPredict: boolean,
     activeOpacity = 1,
-    activeVisible = true
+    activeVisible = true,
+    blendMode = 0,
+    useClip = false
   ): void {
     const gl = this.gl;
+    const p0 = this.p0;
+    const p1 = this.p1;
+    if (!p0 || !p1) return;
+    const m = presentMatrix(view, this.viewW, this.viewH);
+    const fm = fboMatrix(this.viewW, this.viewH);
+
+    // P0: 外側の灰 + 紙 + 下まとめ
+    gl.bindFramebuffer(gl.FRAMEBUFFER, p0.fbo);
+    gl.viewport(0, 0, this.viewW, this.viewH);
+    gl.clearColor(0.2, 0.2, 0.22, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    this.blit(null, p0, m, 1, false, 2, [1, 1, 1, 1]);
+    this.blit(this.below, p0, m, 1, false, 0);
+
+    // P1: 編集中レイヤーを合成モードで
+    gl.bindFramebuffer(gl.FRAMEBUFFER, p1.fbo);
+    gl.viewport(0, 0, this.viewW, this.viewH);
+    gl.disable(gl.BLEND);
+    gl.useProgram(this.composeProg);
+    gl.uniform2f(this.c.uViewSize!, this.viewW, this.viewH);
+    gl.uniform2f(this.c.uDocSize!, this.docW, this.docH);
+    gl.uniformMatrix3fv(this.c.uInv!, false, inverseView(view));
+    const bind = (unit: number, t: Target | null, name: string) => {
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, t ? t.tex : null);
+      gl.uniform1i(this.c[name]!, unit);
+    };
+    bind(0, p0, "uBack");
+    bind(1, this.active, "uActive");
+    bind(2, this.stroke, "uStroke");
+    bind(3, this.predict, "uPredict");
+    bind(4, this.clip, "uClip");
+    gl.uniform1i(this.c.uMode!, blendMode | 0);
+    gl.uniform1f(this.c.uOpacity!, activeVisible ? activeOpacity : 0);
+    gl.uniform1f(this.c.uStrokeOp!, strokeOpacity);
+    gl.uniform1i(this.c.uActiveA8!, this.active?.a8 ? 1 : 0);
+    gl.uniform1i(this.c.uHasClip!, useClip && this.clip ? 1 : 0);
+    gl.uniform1i(this.c.uShowStroke!, showStroke ? 1 : 0);
+    gl.uniform1i(this.c.uShowPredict!, showPredict ? 1 : 0);
+    gl.bindVertexArray(this.blitVao);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    this.drawCalls++;
+    gl.enable(gl.BLEND);
+    gl.activeTexture(gl.TEXTURE0);
+
+    // 上まとめ
+    this.blit(this.above, p1, m, 1, false, 0);
+
+    // 画面へ(ディザ)
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, this.viewW, this.viewH);
     gl.clearColor(0.2, 0.2, 0.22, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
-    const m = presentMatrix(view, this.viewW, this.viewH);
-    this.blit(null, null, m, 1, false, 2, [1, 1, 1, 1]);
-    this.blit(this.below, null, m, 1, true, 0);
-    if (activeVisible) {
-      this.blit(this.active, null, m, activeOpacity, true, this.active?.a8 ? 1 : 0);
-      if (showStroke) this.blit(this.stroke, null, m, strokeOpacity * activeOpacity, true, 0);
-      if (showPredict) this.blit(this.predict, null, m, strokeOpacity * activeOpacity, false, 0);
-    }
-    this.blit(this.above, null, m, 1, true, 0);
+    this.blitFull(p1, fm, true);
+  }
+
+  /** 画面サイズのテクスチャをそのまま画面(または FBO)へ。 */
+  private blitFull(src: Target, m: Mat3, dither: boolean): void {
+    const gl = this.gl;
+    gl.useProgram(this.blitProg);
+    gl.uniform2f(this.u.uDoc!, this.viewW, this.viewH);
+    gl.uniformMatrix3fv(this.u.uM!, false, m);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, src.tex);
+    gl.uniform1i(this.u.uTex!, 0);
+    gl.uniform1f(this.u.uOpacity!, 1);
+    gl.uniform1f(this.u.uDither!, dither ? 1 : 0);
+    gl.uniform1i(this.u.uMode!, 0);
+    gl.bindVertexArray(this.blitVao);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    this.drawCalls++;
   }
 
   /** テスト用: 編集中レイヤーで alpha > 0 の画素数。遅いので本番では呼ばない。 */

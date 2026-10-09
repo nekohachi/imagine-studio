@@ -1,6 +1,7 @@
 //! Document: レイヤーの並びと履歴。フェーズ 1 ではラスターレイヤーだけ、フレームは 1 つ。
 //! グループ、マスク、ベクターなどの種別は docs/03 に沿って後で足す。
 
+use crate::blend::{composite_pixel, BlendMode};
 use crate::cel::{Blend, Cel, Snapshot};
 use crate::history::{Entry, History};
 use crate::tile::{PixelFormat, Rect, TileKey};
@@ -12,7 +13,38 @@ pub struct Layer {
     pub name: String,
     pub visible: bool,
     pub opacity: f32,
+    /// 合成モード
+    pub blend: BlendMode,
+    /// 下のレイヤーでクリッピング(下の絵の具がある所だけに描かれる)
+    pub clip: bool,
     pub cel: Cel,
+}
+
+impl Layer {
+    fn new(id: LayerId, name: &str, format: PixelFormat, width: u32, height: u32) -> Self {
+        Self {
+            id,
+            name: name.to_string(),
+            visible: true,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            clip: false,
+            cel: Cel::new(format, width, height),
+        }
+    }
+
+    /// プリマルチ RGBA8 で矩形を読む(A8 は黒インク)。
+    fn read_rgba(&self, rect: Rect) -> Vec<u8> {
+        match self.cel.format() {
+            PixelFormat::Rgba8 => self.cel.read_rect(rect),
+            PixelFormat::A8 => self
+                .cel
+                .read_rect(rect)
+                .into_iter()
+                .flat_map(|a| [0, 0, 0, a])
+                .collect(),
+        }
+    }
 }
 
 pub struct Document {
@@ -61,14 +93,41 @@ impl Document {
     pub fn add_layer(&mut self, format: PixelFormat, name: &str) -> LayerId {
         let id = self.next_id;
         self.next_id += 1;
-        self.layers.push(Layer {
-            id,
-            name: name.to_string(),
-            visible: true,
-            opacity: 1.0,
-            cel: Cel::new(format, self.width, self.height),
-        });
+        self.layers
+            .push(Layer::new(id, name, format, self.width, self.height));
         id
+    }
+
+    pub fn set_layer_blend(&mut self, id: LayerId, blend: BlendMode) {
+        if let Some(l) = self.layer_mut(id) {
+            l.blend = blend;
+        }
+    }
+
+    pub fn set_layer_clip(&mut self, id: LayerId, clip: bool) {
+        if let Some(l) = self.layer_mut(id) {
+            l.clip = clip;
+        }
+    }
+
+    /// クリッピングの土台(このレイヤーの下で、最初のクリッピングでないレイヤー)。
+    pub fn clip_base_of(&self, id: LayerId) -> Option<LayerId> {
+        let i = self.index_of(id)?;
+        if !self.layers[i].clip {
+            return None;
+        }
+        self.layers[..i].iter().rev().find(|l| !l.clip).map(|l| l.id)
+    }
+
+    /// レイヤーのアルファだけ(A8、全面)。GPU でクリッピングの土台に使う。
+    pub fn layer_alpha(&self, id: LayerId) -> Vec<u8> {
+        let n = self.width as usize * self.height as usize;
+        let Some(l) = self.layer(id) else { return vec![0; n] };
+        let rect = self.bounds();
+        match l.cel.format() {
+            PixelFormat::A8 => l.cel.read_rect(rect),
+            PixelFormat::Rgba8 => l.cel.read_rect(rect).chunks_exact(4).map(|p| p[3]).collect(),
+        }
     }
 
     /// 読み込み用: id と属性を指定して足す(履歴には積まない)。id が既にあれば None。
@@ -84,13 +143,10 @@ impl Document {
             return None;
         }
         self.next_id = self.next_id.max(id + 1);
-        self.layers.push(Layer {
-            id,
-            name: name.to_string(),
-            visible,
-            opacity: opacity.clamp(0.0, 1.0),
-            cel: Cel::new(format, self.width, self.height),
-        });
+        let mut l = Layer::new(id, name, format, self.width, self.height);
+        l.visible = visible;
+        l.opacity = opacity.clamp(0.0, 1.0);
+        self.layers.push(l);
         self.layers.last_mut()
     }
 
@@ -123,6 +179,8 @@ impl Document {
             name: format!("{} のコピー", src.name),
             visible: src.visible,
             opacity: src.opacity,
+            blend: src.blend,
+            clip: src.clip,
             cel,
         };
         self.layers.insert(i + 1, layer);
@@ -161,23 +219,33 @@ impl Document {
         }
         let mut all_changed = Vec::new();
         for k in upper.cel.keys() {
-            let Some(t) = upper.cel.tile(k) else { continue };
-            // タイルをプリマルチ RGBA8 の矩形にして、通常合成で焼く
+            if upper.cel.tile(k).is_none() {
+                continue;
+            }
+            // タイルをプリマルチ RGBA8 の矩形にして、上のレイヤーの合成モードで焼く
             let rect = k.rect().intersect(&self.bounds());
             if rect.is_empty() {
                 continue;
             }
-            let src = match t.format {
-                PixelFormat::Rgba8 => upper.cel.read_rect(rect),
-                PixelFormat::A8 => upper
-                    .cel
-                    .read_rect(rect)
-                    .into_iter()
-                    .flat_map(|a| [0, 0, 0, a])
-                    .collect(),
-            };
+            let src = upper.read_rgba(rect);
             let lower = &mut self.layers[i - 1];
-            let snap = lower.cel.composite(rect, &src, upper.opacity, Blend::Normal);
+            let snap = if upper.blend == BlendMode::Normal && !upper.clip && lower.cel.format() == PixelFormat::Rgba8 {
+                lower.cel.composite(rect, &src, upper.opacity, Blend::Normal)
+            } else {
+                // モード付き: 下の画素を読んで画素ごとに合成し、書き戻す
+                let mut dst = lower.read_rgba(rect);
+                for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                    let op = if upper.clip { upper.opacity * d[3] as f32 / 255.0 } else { upper.opacity };
+                    composite_pixel(upper.blend, d, s, op);
+                }
+                match lower.cel.format() {
+                    PixelFormat::Rgba8 => lower.cel.write_rect(rect, &dst),
+                    PixelFormat::A8 => {
+                        let a: Vec<u8> = dst.chunks_exact(4).map(|p| p[3]).collect();
+                        lower.cel.write_rect(rect, &a)
+                    }
+                }
+            };
             let keys: Vec<_> = snap.iter().map(|(k, _)| *k).collect();
             self.history.push(Entry {
                 label: "結合".into(),
@@ -313,49 +381,74 @@ impl Document {
         self.flatten_range(0, self.layers.len(), rect)
     }
 
-    /// 並び `from..to`(下から数えた添字)のレイヤーだけをまとめる。
+    /// 並び `from..to`(下から数えた添字)のレイヤーだけをまとめる(透明の上に)。
     /// 編集中レイヤーの「下」「上」をそれぞれ 1 枚にするのに使う(docs/02 の 3 枚方式)。
+    /// 合成モードは下に絵の具がある所だけに効く。クリッピングは土台のアルファで絞る。
     pub fn flatten_range(&self, from: usize, to: usize, rect: Rect) -> Vec<u8> {
+        self.flatten_onto(from, to, rect, None)
+    }
+
+    /// 白い紙の上にまとめる(表示用。乗算などが紙の上で正しく見える)。
+    pub fn flatten_range_on_white(&self, from: usize, to: usize, rect: Rect) -> Vec<u8> {
+        self.flatten_onto(from, to, rect, Some([255, 255, 255, 255]))
+    }
+
+    fn flatten_onto(&self, from: usize, to: usize, rect: Rect, base: Option<[u8; 4]>) -> Vec<u8> {
         let n = rect.w.max(0) as usize * rect.h.max(0) as usize;
         let mut out = vec![0u8; n * 4];
+        if let Some(b) = base {
+            for p in out.chunks_exact_mut(4) {
+                p.copy_from_slice(&b);
+            }
+        }
         let to = to.min(self.layers.len());
         if from >= to {
             return out;
         }
-        for l in &self.layers[from..to] {
-            if !l.visible || l.opacity <= 0.0 {
-                continue;
+        let mut i = from;
+        while i < to {
+            let l = &self.layers[i];
+            // クリッピングのかたまり: 土台 + その上に続くクリップ付きレイヤー
+            let mut j = i + 1;
+            while j < to && self.layers[j].clip {
+                j += 1;
             }
-            let opq = (l.opacity.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
-            let px = l.cel.read_rect(rect);
-            match l.cel.format() {
-                PixelFormat::Rgba8 => {
-                    for (s, d) in px.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
-                        let sa = (s[3] as u32 * opq + 127) / 255;
-                        if sa == 0 {
+            if l.visible && l.opacity > 0.0 {
+                if j == i + 1 {
+                    let px = l.read_rgba(rect);
+                    for (d, s) in out.chunks_exact_mut(4).zip(px.chunks_exact(4)) {
+                        composite_pixel(l.blend, d, s, l.opacity);
+                    }
+                } else {
+                    // 土台をコピーし、クリップ付きを土台のアルファで絞って重ね、かたまりごと合成する
+                    let mut group = l.read_rgba(rect);
+                    for c in &self.layers[i + 1..j] {
+                        if !c.visible || c.opacity <= 0.0 {
                             continue;
                         }
-                        let f = 255 - sa;
-                        for c in 0..4 {
-                            let sc = (s[c] as u32 * opq + 127) / 255;
-                            d[c] = (sc + (d[c] as u32 * f + 127) / 255).min(255) as u8;
+                        let px = c.read_rgba(rect);
+                        let base_alpha: Vec<u8> = group.chunks_exact(4).map(|p| p[3]).collect();
+                        for ((d, s), ba) in group.chunks_exact_mut(4).zip(px.chunks_exact(4)).zip(base_alpha.iter()) {
+                            // 土台の無い所には描かれない
+                            composite_pixel(c.blend, d, s, c.opacity * (*ba as f32 / 255.0));
                         }
                     }
-                }
-                PixelFormat::A8 => {
-                    for (s, d) in px.iter().zip(out.chunks_exact_mut(4)) {
-                        let sa = (*s as u32 * opq + 127) / 255;
-                        if sa == 0 {
-                            continue;
+                    // クリップ付きが土台の外へはみ出さないように、土台の元のアルファで切る
+                    let base_px = l.read_rgba(rect);
+                    for (g, b) in group.chunks_exact_mut(4).zip(base_px.chunks_exact(4)) {
+                        if g[3] > b[3] {
+                            let k = b[3] as f32 / g[3] as f32;
+                            for c in 0..4 {
+                                g[c] = (g[c] as f32 * k + 0.5) as u8;
+                            }
                         }
-                        let f = 255 - sa;
-                        for c in 0..3 {
-                            d[c] = ((d[c] as u32 * f + 127) / 255) as u8;
-                        }
-                        d[3] = (sa + (d[3] as u32 * f + 127) / 255).min(255) as u8;
+                    }
+                    for (d, s) in out.chunks_exact_mut(4).zip(group.chunks_exact(4)) {
+                        composite_pixel(l.blend, d, s, l.opacity);
                     }
                 }
             }
+            i = j;
         }
         out
     }
@@ -486,6 +579,43 @@ mod tests {
         assert!(!doc.remove_layer(a));
         doc.set_layer_name(a, "下地");
         assert_eq!(doc.layer(a).unwrap().name, "下地");
+    }
+
+    #[test]
+    fn flatten_with_blend_mode_and_clipping() {
+        let mut doc = Document::new(64, 64, 1 << 20);
+        let base = doc.add_layer(PixelFormat::Rgba8, "base");
+        let shade = doc.add_layer(PixelFormat::Rgba8, "shade");
+        let r_base = Rect::new(0, 0, 2, 1); // 土台は左 2 画素だけ
+        let r_all = Rect::new(0, 0, 4, 1);
+        doc.composite_stroke(base, r_base, &solid(r_base, [255, 255, 255, 255]), 1.0, Blend::Normal);
+        doc.composite_stroke(shade, r_all, &solid(r_all, [128, 128, 128, 255]), 1.0, Blend::Normal);
+        doc.set_layer_blend(shade, BlendMode::Multiply);
+        doc.set_layer_clip(shade, true);
+        assert_eq!(doc.clip_base_of(shade), Some(base));
+        assert_eq!(doc.clip_base_of(base), None);
+        let px = doc.flatten_rgba8(r_all);
+        // 土台のある所: 白 × 灰 = 灰。土台の無い所: クリップで何も無い
+        assert!((px[0] as i32 - 128).abs() <= 1 && px[3] == 255, "{px:?}");
+        assert_eq!(px[2 * 4 + 3], 0, "{px:?}");
+        // クリップを外すと、土台の無い所は通常で描かれる
+        doc.set_layer_clip(shade, false);
+        let px = doc.flatten_rgba8(r_all);
+        assert_eq!(px[2 * 4 + 3], 255);
+        assert!((px[2 * 4] as i32 - 128).abs() <= 1);
+        // 紙の上では乗算が白に効く
+        let on_white = doc.flatten_range_on_white(0, 2, r_all);
+        assert!((on_white[2 * 4] as i32 - 128).abs() <= 1, "{on_white:?}");
+        // アルファのマスク
+        let a = doc.layer_alpha(base);
+        assert_eq!(a.len(), 64 * 64);
+        assert_eq!(a[0], 255);
+        assert_eq!(a[3], 0);
+        // モード付きの結合も同じ見た目になる
+        doc.set_layer_clip(shade, true);
+        let before = doc.flatten_rgba8(r_all);
+        doc.merge_down(shade).unwrap();
+        assert_eq!(doc.flatten_rgba8(r_all), before);
     }
 
     #[test]

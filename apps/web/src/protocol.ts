@@ -51,6 +51,9 @@ export interface LayerInfo {
   visible: boolean;
   a8: boolean;
   opacity: number;
+  /** 合成モード(blendNames の添字) */
+  blend: number;
+  clip: boolean;
 }
 
 export type ToWorker =
@@ -76,6 +79,8 @@ export type ToWorker =
   | { type: "layerOp"; op: "remove" | "duplicate" | "mergeDown" | "moveUp" | "moveDown"; id: number }
   | { type: "renameLayer"; id: number; name: string }
   | { type: "setLayerOpacity"; id: number; opacity: number }
+  | { type: "setLayerBlend"; id: number; blend: number }
+  | { type: "setLayerClip"; id: number; clip: boolean }
   | { type: "thumbnails"; size: number }
   | { type: "sample"; id: number; x: number; y: number }
   | { type: "line"; x0: number; y0: number; x1: number; y1: number; pressure: number; commit: boolean }
@@ -121,6 +126,7 @@ export type FromWorker =
       docH: number;
       restored: boolean;
       presets: BrushPreset[];
+      blendNames: string[];
     }
   | { type: "doc"; docW: number; docH: number; layers: LayerInfo[]; active: number }
   | { type: "layers"; layers: LayerInfo[]; active: number }

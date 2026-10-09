@@ -4,7 +4,7 @@
 //! 眺めは wasm メモリが伸びると無効になるので、受け取ったらすぐ texSubImage2D に渡し、
 //! 持ち越さないこと。
 
-use canvas_core::{Blend, Document, PixelFormat, Rect, TileKey};
+use canvas_core::{Blend, BlendMode, Document, PixelFormat, Rect, TileKey};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -116,6 +116,38 @@ impl Doc {
 
     pub fn set_layer_name(&mut self, id: u32, name: &str) {
         self.inner.set_layer_name(id, name);
+    }
+    /// 合成モード(BlendMode::ALL の添字)。
+    pub fn layer_blend(&self, id: u32) -> u32 {
+        self.inner.layer(id).map_or(0, |l| l.blend.index())
+    }
+    pub fn set_layer_blend(&mut self, id: u32, index: u32) {
+        self.inner.set_layer_blend(id, BlendMode::from_index(index));
+    }
+    /// 合成モードの名前の一覧(添字順)。
+    pub fn blend_names() -> js_sys::Array {
+        BlendMode::ALL.iter().map(|m| JsValue::from_str(m.name())).collect()
+    }
+    pub fn layer_clip(&self, id: u32) -> bool {
+        self.inner.layer(id).is_some_and(|l| l.clip)
+    }
+    pub fn set_layer_clip(&mut self, id: u32, clip: bool) {
+        self.inner.set_layer_clip(id, clip);
+    }
+    /// クリッピングの土台の id(無ければ 0)。
+    pub fn clip_base(&self, id: u32) -> u32 {
+        self.inner.clip_base_of(id).unwrap_or(0)
+    }
+    /// レイヤーのアルファ(A8、全面)。
+    pub fn layer_alpha(&self, id: u32) -> js_sys::Uint8Array {
+        js_sys::Uint8Array::from(self.inner.layer_alpha(id).as_slice())
+    }
+    /// 白い紙の上にまとめた RGBA8(表示用、不透明)。
+    pub fn flatten_range_on_white(&self, from: u32, to: u32, x: i32, y: i32, w: i32, h: i32) -> js_sys::Uint8Array {
+        let v = self
+            .inner
+            .flatten_range_on_white(from as usize, to as usize, Rect::new(x, y, w, h));
+        js_sys::Uint8Array::from(v.as_slice())
     }
     pub fn remove_layer(&mut self, id: u32) -> bool {
         self.inner.remove_layer(id)

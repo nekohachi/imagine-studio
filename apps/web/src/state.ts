@@ -50,6 +50,8 @@ export type StateEvent = "brush" | "color" | "layers" | "view" | "doc" | "stats"
 export class AppState {
   settings = loadSettings();
   presets: BrushPreset[] = [];
+  /** 合成モードの名前(添字がワーカーの番号) */
+  blendNames: string[] = ["normal"];
   /** 今のブラシ定義(JSON オブジェクト)。消しゴムは eraser フラグ */
   brush: BrushJson = { name: "ブラシ", size: 6, stabilizer: 8, hardness: 0.7, opacity: 1, eraser: false };
   /** 消しゴムに切り替える前のブラシ名(戻すため) */

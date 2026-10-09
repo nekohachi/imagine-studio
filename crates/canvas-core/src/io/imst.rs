@@ -30,6 +30,10 @@ struct LayerJson {
     visible: bool,
     opacity: f32,
     format: String,
+    #[serde(default)]
+    blend: String,
+    #[serde(default)]
+    clip: bool,
     tiles: Vec<[i32; 2]>,
 }
 
@@ -80,6 +84,8 @@ pub fn save(doc: &Document) -> Vec<u8> {
             visible: l.visible,
             opacity: l.opacity,
             format: fmt_name(l.cel.format()).into(),
+            blend: l.blend.name().into(),
+            clip: l.clip,
             tiles: keys.iter().map(|k| [k.tx, k.ty]).collect(),
         });
         for k in keys {
@@ -113,6 +119,8 @@ pub fn load(bytes: &[u8], history_limit_bytes: usize) -> Result<Document, String
         let layer = doc
             .add_layer_with(lj.id, format, &lj.name, lj.visible, lj.opacity)
             .ok_or_else(|| format!("レイヤー id {} が重複", lj.id))?;
+        layer.blend = crate::blend::BlendMode::parse(&lj.blend).unwrap_or_default();
+        layer.clip = lj.clip;
         for [tx, ty] in &lj.tiles {
             let k = TileKey::new(*tx, *ty);
             let data = r.read(&tile_path(lj.id, k))?;
