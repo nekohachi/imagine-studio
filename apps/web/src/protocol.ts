@@ -2,8 +2,29 @@
 // 入力点は [x, y, pressure, time] の 4 要素ずつ、ダブは [x, y, radius, opacity] の 4 要素ずつ。
 // 座標はドキュメント px(キャンバスの画素)。画面との変換は View で行う。
 
-export const POINT_STRIDE = 4;
-export const DAB_STRIDE = 4;
+/** 入力点: x, y, pressure, time, tiltX, tiltY */
+export const POINT_STRIDE = 6;
+/** ダブ: x, y, radius, opacity, angle, aspect, colorPacked, 予備 */
+export const DAB_STRIDE = 8;
+
+/** RGB(0..1)を 1 つの float に詰める(24bit なので f32 で正確に持てる)。 */
+export function packColor(c: [number, number, number]): number {
+  const r = Math.round(Math.min(1, Math.max(0, c[0])) * 255);
+  const g = Math.round(Math.min(1, Math.max(0, c[1])) * 255);
+  const b = Math.round(Math.min(1, Math.max(0, c[2])) * 255);
+  return r * 65536 + g * 256 + b;
+}
+
+/** ブラシ定義の JSON のうち、UI が直接触る項目。残りは brush-core が解釈する。 */
+export interface BrushJson {
+  name: string;
+  size: number;
+  stabilizer: number;
+  hardness: number;
+  opacity: number;
+  eraser: boolean;
+  [key: string]: unknown;
+}
 
 /** 画面(backing px)= scale · R(rot) · doc + (tx, ty) */
 export interface View {
@@ -14,14 +35,14 @@ export interface View {
 }
 
 export interface BrushSettings {
-  radius: number;
-  stabilizer: number;
-  hardness: number;
-  opacity: number;
-  flow: number;
-  spacing: number;
+  /** brush-core の BrushDef の JSON */
+  json: string;
   color: [number, number, number];
-  eraser: boolean;
+}
+
+export interface BrushPreset {
+  name: string;
+  json: string;
 }
 
 export interface LayerInfo {
@@ -92,6 +113,7 @@ export type FromWorker =
       docW: number;
       docH: number;
       restored: boolean;
+      presets: BrushPreset[];
     }
   | { type: "doc"; docW: number; docH: number; layers: LayerInfo[]; active: number }
   | { type: "layers"; layers: LayerInfo[]; active: number }

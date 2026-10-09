@@ -5,3 +5,5 @@ edition.workspace = true
 description = "GPU非依存のブラシエンジンコア: 入力補間・手ぶれ補正・筆圧カーブ・スタンプ生成"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

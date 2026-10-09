@@ -4,8 +4,17 @@
 import init, { Brush, Doc, Stroke, version } from "./wasm/imagine_wasm.js";
 import wasmUrl from "./wasm/imagine_wasm_bg.wasm?url";
 import { Renderer } from "./gl";
-import { extrapolateDabs } from "./input";
-import type { BrushSettings, FromWorker, LayerInfo, Stats, ToWorker, View } from "./protocol";
+import { extrapolateDabs, fillDabColor } from "./input";
+import {
+  DAB_STRIDE,
+  packColor,
+  type BrushPreset,
+  type FromWorker,
+  type LayerInfo,
+  type Stats,
+  type ToWorker,
+  type View,
+} from "./protocol";
 import { idbGet, idbPut } from "./storage";
 
 const HISTORY_MB = 64;
@@ -15,20 +24,12 @@ const AUTOSAVE_DELAY_MS = 2000;
 let renderer: Renderer | null = null;
 let doc: Doc | null = null;
 let brush: Brush | null = null;
-let settings: BrushSettings = {
-  radius: 6,
-  stabilizer: 8,
-  hardness: 0.7,
-  opacity: 1,
-  flow: 0.9,
-  spacing: 0.2,
-  color: [0.1, 0.1, 0.1],
-  eraser: false,
-};
+let brushJson = "{}";
+let color = packColor([0.1, 0.1, 0.1]);
 let view: View = { scale: 1, tx: 0, ty: 0, rot: 0 };
 let active = 0;
 let stroke: Stroke | null = null;
-let lastDab: [number, number] | null = null;
+let lastDab: number[] | null = null;
 let lastStrokeDabs = 0;
 let lastBakeMs = 0;
 // このストロークで触った矩形(ドキュメント px)
@@ -38,14 +39,25 @@ function post(m: FromWorker, transfer: Transferable[] = []): void {
   (self as unknown as Worker).postMessage(m, transfer);
 }
 
+/** JSON からブラシを作り直す。壊れた JSON なら前のブラシを保つ。 */
 function applyBrush(): void {
-  if (!brush) return;
-  brush.radius = settings.radius;
-  brush.stabilizer = settings.stabilizer;
-  brush.hardness = settings.hardness;
-  brush.opacity = settings.opacity;
-  brush.flow = settings.flow;
-  brush.spacing = settings.spacing;
+  try {
+    const next = Brush.from_json(brushJson);
+    brush?.free();
+    brush = next;
+  } catch (e) {
+    post({ type: "error", message: "ブラシ定義が読めない: " + String(e) });
+    if (!brush) brush = new Brush();
+  }
+}
+
+function presets(): BrushPreset[] {
+  const list = JSON.parse(Brush.presets_json()) as Array<{ name: string }>;
+  return list.map((p) => ({ name: p.name, json: JSON.stringify(p) }));
+}
+
+function brushOpacity(): number {
+  return brush ? brush.opacity : 1;
 }
 
 function layerInfos(): LayerInfo[] {
@@ -109,7 +121,7 @@ function rebuildMerged(): void {
 }
 
 function present(showStroke = false, showPredict = false): void {
-  renderer?.present(view, settings.opacity, showStroke, showPredict);
+  renderer?.present(view, brushOpacity(), showStroke, showPredict);
 }
 
 // ---- 自動保存(変更から 2 秒後、連続する変更はまとめる) ----
@@ -159,10 +171,10 @@ function mountDoc(next: Doc): void {
 }
 
 function growBbox(dabs: Float32Array): void {
-  for (let i = 0; i + 3 < dabs.length; i += 4) {
+  for (let i = 0; i + 3 < dabs.length; i += DAB_STRIDE) {
     const x = dabs[i]!;
     const y = dabs[i + 1]!;
-    const r = dabs[i + 2]! + 2;
+    const r = Math.max(dabs[i + 2]!, 0.75) + 2;
     if (!bbox) bbox = { x0: x - r, y0: y - r, x1: x + r, y1: y + r };
     else {
       bbox.x0 = Math.min(bbox.x0, x - r);
@@ -185,7 +197,7 @@ function bake(): void {
   const h = y1 - y;
   if (w > 0 && h > 0) {
     const px = renderer.readStroke(x, y, w, h);
-    const changed = doc.composite_stroke(active, x, y, w, h, px, settings.opacity, settings.eraser);
+    const changed = doc.composite_stroke(active, x, y, w, h, px, brushOpacity(), brush?.eraser ?? false);
     uploadActiveTiles(changed);
   }
   lastBakeMs = performance.now() - t0;
@@ -231,7 +243,6 @@ async function handle(m: ToWorker): Promise<void> {
   switch (m.type) {
     case "init": {
       await init({ module_or_path: wasmUrl });
-      brush = new Brush();
       applyBrush();
       view = m.view;
       renderer = new Renderer(m.canvas, m.viewW, m.viewH);
@@ -262,6 +273,7 @@ async function handle(m: ToWorker): Promise<void> {
         docW: doc!.width,
         docH: doc!.height,
         restored,
+        presets: presets(),
       });
       post({ type: "stats", stats: stats(performance.now(), 0, 0) });
       return;
@@ -275,7 +287,8 @@ async function handle(m: ToWorker): Promise<void> {
       present(stroke !== null, stroke !== null);
       return;
     case "brush":
-      settings = m.brush;
+      brushJson = m.brush.json;
+      color = packColor(m.brush.color);
       applyBrush();
       return;
     case "begin": {
@@ -294,30 +307,31 @@ async function handle(m: ToWorker): Promise<void> {
       if (!renderer || !stroke) return;
       const t0 = performance.now();
       renderer.drawCalls = 0;
-      const dabs = stroke.add_points(m.data);
+      const hardness = brush?.hardness ?? 0.7;
+      const dabs = fillDabColor(stroke.add_points(m.data), color);
       if (dabs.length) {
-        renderer.drawDabs(dabs, settings.color, settings.hardness);
+        renderer.drawDabs(dabs, hardness);
         growBbox(dabs);
-        lastDab = [dabs[dabs.length - 4]!, dabs[dabs.length - 3]!];
+        lastDab = Array.from(dabs.subarray(dabs.length - DAB_STRIDE));
       }
       if (lastDab && m.predicted.length) {
-        const pd = extrapolateDabs(lastDab[0], lastDab[1], settings.radius, settings.flow, settings.spacing, m.predicted);
-        renderer.drawPredicted(pd, settings.color, settings.hardness);
+        const pd = extrapolateDabs(lastDab, brush?.spacing ?? 0.2, m.predicted);
+        renderer.drawPredicted(pd, hardness);
       } else {
-        renderer.drawPredicted(new Float32Array(0), settings.color, settings.hardness);
+        renderer.drawPredicted(new Float32Array(0), hardness);
       }
       present(true, true);
       const lastT = m.data.length >= 4 ? m.data[m.data.length - 1]! : 0;
-      post({ type: "stats", stats: stats(t0, dabs.length / 4, lastT) });
+      post({ type: "stats", stats: stats(t0, dabs.length / DAB_STRIDE, lastT) });
       return;
     }
     case "end": {
       if (!renderer || !stroke) return;
       const t0 = performance.now();
       renderer.drawCalls = 0;
-      const dabs = stroke.finish();
+      const dabs = fillDabColor(stroke.finish(), color);
       if (dabs.length) {
-        renderer.drawDabs(dabs, settings.color, settings.hardness);
+        renderer.drawDabs(dabs, brush?.hardness ?? 0.7);
         growBbox(dabs);
       }
       lastStrokeDabs = stroke.dab_count;
@@ -329,7 +343,7 @@ async function handle(m: ToWorker): Promise<void> {
       renderer.endStroke();
       present();
       scheduleAutosave();
-      post({ type: "stats", stats: stats(t0, dabs.length / 4, 0) });
+      post({ type: "stats", stats: stats(t0, dabs.length / DAB_STRIDE, 0) });
       return;
     }
     case "cancel": {
@@ -427,8 +441,30 @@ async function handle(m: ToWorker): Promise<void> {
   }
 }
 
+// init(wasm の読み込み)が終わるまでは、他のメッセージを順番どおりに待たせる
+let initialized = false;
+const pending: ToWorker[] = [];
+
+function fail(err: unknown): void {
+  post({ type: "error", message: err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err) });
+}
+
 self.onmessage = (e: MessageEvent<ToWorker>) => {
-  handle(e.data).catch((err: unknown) => {
-    post({ type: "error", message: err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err) });
-  });
+  const m = e.data;
+  if (!initialized) {
+    if (m.type !== "init") {
+      pending.push(m);
+      return;
+    }
+    handle(m)
+      .then(async () => {
+        initialized = true;
+        for (const q of pending.splice(0)) {
+          await handle(q).catch(fail);
+        }
+      })
+      .catch(fail);
+    return;
+  }
+  handle(m).catch(fail);
 };

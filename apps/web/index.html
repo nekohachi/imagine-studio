@@ -104,6 +104,44 @@
         border-radius: 8px;
         background: none;
       }
+      #brushJsonBox {
+        position: fixed;
+        left: 8px;
+        top: calc(env(safe-area-inset-top, 0) + 8px);
+        width: min(420px, calc(100vw - 16px));
+        padding: 8px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        backdrop-filter: blur(6px);
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      #brushJsonBox[hidden] {
+        display: none;
+      }
+      #brushJson {
+        width: 100%;
+        height: min(50vh, 420px);
+        box-sizing: border-box;
+        font: 11px/1.4 ui-monospace, Menlo, monospace;
+        background: rgba(0, 0, 0, 0.3);
+        color: var(--fg);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        resize: vertical;
+      }
+      #brushJsonBox button {
+        align-self: flex-end;
+        min-height: 36px;
+        padding: 0 14px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: var(--accent);
+        color: #10131a;
+        font: inherit;
+      }
       #err {
         position: fixed;
         left: 8px;
@@ -121,8 +159,14 @@
     <canvas id="canvas"></canvas>
     <div id="hud">起動中…</div>
     <div id="err"></div>
+    <div id="brushJsonBox" hidden>
+      <textarea id="brushJson" spellcheck="false"></textarea>
+      <button id="brushJsonApply">適用</button>
+    </div>
     <div id="bar">
-      <label>半径 <input id="radius" type="range" min="0.5" max="64" step="0.5" value="6" /><span id="radiusV">6</span></label>
+      <label>ブラシ <select id="preset"></select></label>
+      <button id="brushJsonToggle">JSON</button>
+      <label>半径 <input id="radius" type="range" min="0.5" max="200" step="0.5" value="6" /><span id="radiusV">6</span></label>
       <label>手ブレ <input id="stab" type="range" min="0" max="40" step="1" value="8" /><span id="stabV">8</span></label>
       <label>硬さ <input id="hard" type="range" min="0" max="1" step="0.05" value="0.7" /><span id="hardV">0.7</span></label>
       <label>不透明 <input id="opacity" type="range" min="0.05" max="1" step="0.05" value="1" /><span id="opacityV">1</span></label>

@@ -21,6 +21,9 @@ pub fn catmull_rom(p0: PolyPoint, p1: PolyPoint, p2: PolyPoint, p3: PolyPoint, t
         y: w0 * p0.y + w1 * p1.y + w2 * p2.y + w3 * p3.y,
         pressure: (w0 * p0.pressure + w1 * p1.pressure + w2 * p2.pressure + w3 * p3.pressure)
             .clamp(0.0, 1.0),
+        tilt_x: w0 * p0.tilt_x + w1 * p1.tilt_x + w2 * p2.tilt_x + w3 * p3.tilt_x,
+        tilt_y: w0 * p0.tilt_y + w1 * p1.tilt_y + w2 * p2.tilt_y + w3 * p3.tilt_y,
+        speed: (w0 * p0.speed + w1 * p1.speed + w2 * p2.speed + w3 * p3.speed).max(0.0),
     }
 }
 
@@ -109,7 +112,7 @@ mod tests {
     use super::*;
 
     fn pt(x: f32, y: f32) -> PolyPoint {
-        PolyPoint { x, y, pressure: 1.0 }
+        PolyPoint::new(x, y, 1.0)
     }
 
     #[test]
@@ -166,11 +169,7 @@ mod tests {
         let mut s = SplineSampler::new(1.0);
         let mut all = vec![];
         for (i, pr) in [0.0f32, 0.3, 0.8, 1.0].iter().enumerate() {
-            all.extend(s.push(PolyPoint {
-                x: i as f32 * 30.0,
-                y: 0.0,
-                pressure: *pr,
-            }));
+            all.extend(s.push(PolyPoint::new(i as f32 * 30.0, 0.0, *pr)));
         }
         all.extend(s.finish());
         for p in &all {

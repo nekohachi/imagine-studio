@@ -19,18 +19,32 @@ const DAB_VS = `#version 300 es
 precision highp float;
 layout(location=0) in vec2 corner;      // -1..1 の四角
 layout(location=1) in vec4 dab;         // x, y, radius, opacity(インスタンス)
+layout(location=2) in vec4 dab2;        // angle, aspect, colorPacked, 予備(インスタンス)
 uniform vec2 uSize;                     // 描画先の px サイズ
 out vec2 vUv;
 out float vRadius;
 out float vOpacity;
+out vec3 vColor;
 void main() {
-  float r = dab.z + 1.0;                // AA のために半径より 1px 広く取る
-  vec2 p = dab.xy + corner * r;
+  // 1px 未満の細い線は、半径を 0.75 に留めて不透明度で面積を表す(点々にならない)
+  float r0 = dab.z;
+  float r = max(r0, 0.75);
+  float cov = (r0 * r0) / (r * r);
+  float rr = r + 1.0;                   // AA のために半径より 1px 広く取る
+  vec2 local = vec2(corner.x, corner.y * dab2.y) * rr;
+  float c = cos(dab2.x);
+  float s = sin(dab2.x);
+  vec2 p = dab.xy + vec2(c * local.x - s * local.y, s * local.x + c * local.y);
   vec2 ndc = (p / uSize) * 2.0 - 1.0;
   gl_Position = vec4(ndc, 0.0, 1.0);
-  vUv = corner * r;
-  vRadius = dab.z;
-  vOpacity = dab.w;
+  vUv = corner * rr;                    // 扁平は形で表し、距離は円のまま測る
+  vRadius = r;
+  vOpacity = dab.w * cov;
+  float packed = dab2.z;
+  float cr = floor(packed / 65536.0);
+  float cg = floor((packed - cr * 65536.0) / 256.0);
+  float cb = packed - cr * 65536.0 - cg * 256.0;
+  vColor = vec3(cr, cg, cb) / 255.0;
 }`;
 
 const DAB_FS = `#version 300 es
@@ -38,7 +52,7 @@ precision highp float;
 in vec2 vUv;
 in float vRadius;
 in float vOpacity;
-uniform vec3 uColor;
+in vec3 vColor;
 uniform float uHardness;
 out vec4 o;
 void main() {
@@ -47,7 +61,7 @@ void main() {
   // hardness=1 で 1.5px の AA、hardness=0 で中心から薄くなる
   float edge0 = min(r * uHardness, max(r - 1.5, 0.0));
   float a = (1.0 - smoothstep(edge0, r, d)) * vOpacity;
-  o = vec4(uColor * a, a);
+  o = vec4(vColor * a, a);
 }`;
 
 const BLIT_VS = `#version 300 es
@@ -178,7 +192,7 @@ export class Renderer {
     const gl = this.gl;
     this.dabProg = this.program(DAB_VS, DAB_FS);
     this.blitProg = this.program(BLIT_VS, BLIT_FS);
-    for (const n of ["uSize", "uColor", "uHardness"]) this.u[n] = gl.getUniformLocation(this.dabProg, n)!;
+    for (const n of ["uSize", "uHardness"]) this.u[n] = gl.getUniformLocation(this.dabProg, n)!;
     for (const n of ["uDoc", "uM", "uTex", "uOpacity", "uDither", "uMode", "uSolid"]) {
       this.u[n] = gl.getUniformLocation(this.blitProg, n)!;
     }
@@ -198,8 +212,11 @@ export class Renderer {
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.dabVbo);
     gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 16, 0);
+    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 32, 0);
     gl.vertexAttribDivisor(1, 1);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 32, 16);
+    gl.vertexAttribDivisor(2, 1);
 
     this.blitVao = gl.createVertexArray()!;
     gl.bindVertexArray(this.blitVao);
@@ -349,24 +366,24 @@ export class Renderer {
     this.clearTarget(this.predict);
   }
 
-  drawDabs(dabs: Float32Array, color: [number, number, number], hardness: number): void {
-    this.drawDabsTo(this.stroke, dabs, color, hardness);
+  /** ダブは DAB_STRIDE(8)要素ずつ。色は 7 番目に詰めてある。 */
+  drawDabs(dabs: Float32Array, hardness: number): void {
+    this.drawDabsTo(this.stroke, dabs, hardness);
   }
 
-  drawPredicted(dabs: Float32Array, color: [number, number, number], hardness: number): void {
+  drawPredicted(dabs: Float32Array, hardness: number): void {
     this.clearTarget(this.predict);
-    if (dabs.length) this.drawDabsTo(this.predict, dabs, color, hardness);
+    if (dabs.length) this.drawDabsTo(this.predict, dabs, hardness);
   }
 
-  private drawDabsTo(t: Target | null, dabs: Float32Array, color: [number, number, number], hardness: number): void {
-    const n = (dabs.length / 4) | 0;
+  private drawDabsTo(t: Target | null, dabs: Float32Array, hardness: number): void {
+    const n = (dabs.length / 8) | 0;
     if (!t || n === 0) return;
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo);
     gl.viewport(0, 0, t.w, t.h);
     gl.useProgram(this.dabProg);
     gl.uniform2f(this.u.uSize!, t.w, t.h);
-    gl.uniform3f(this.u.uColor!, color[0], color[1], color[2]);
     gl.uniform1f(this.u.uHardness!, hardness);
     gl.bindVertexArray(this.dabVao);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.dabVbo);

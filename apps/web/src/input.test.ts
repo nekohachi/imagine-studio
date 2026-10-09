@@ -1,14 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { PalmGuard, PointPacker, SpeedPressure, extrapolateDabs, normalizePressure } from "./input";
+import { PalmGuard, PointPacker, SpeedPressure, extrapolateDabs, fillDabColor, normalizePressure } from "./input";
+import { DAB_STRIDE, POINT_STRIDE, packColor } from "./protocol";
 
 describe("PointPacker", () => {
   it("詰めた順に取り出せて、取り出すと空になる", () => {
     const p = new PointPacker();
     p.push(1, 2, 0.5, 10);
-    p.push(3, 4, 0.75, 20);
+    p.push(3, 4, 0.75, 20, 30, -10);
     expect(p.length).toBe(2);
     const a = p.take();
-    expect(Array.from(a)).toEqual([1, 2, 0.5, 10, 3, 4, 0.75, 20]);
+    expect(Array.from(a)).toEqual([1, 2, 0.5, 10, 0, 0, 3, 4, 0.75, 20, 30, -10]);
     expect(p.length).toBe(0);
     expect(p.take().length).toBe(0);
   });
@@ -17,8 +18,8 @@ describe("PointPacker", () => {
     const p = new PointPacker();
     for (let i = 0; i < 5000; i++) p.push(i, i, 1, i);
     const a = p.take();
-    expect(a.length).toBe(5000 * 4);
-    expect(a[4 * 4999]).toBe(4999);
+    expect(a.length).toBe(5000 * POINT_STRIDE);
+    expect(a[POINT_STRIDE * 4999]).toBe(4999);
   });
 });
 
@@ -54,21 +55,44 @@ describe("normalizePressure", () => {
   });
 });
 
+describe("packColor", () => {
+  it("24bit に詰める", () => {
+    expect(packColor([1, 0, 0])).toBe(255 * 65536);
+    expect(packColor([0, 0, 1])).toBe(255);
+    expect(packColor([2, -1, 0.5])).toBe(255 * 65536 + 128);
+  });
+});
+
 describe("extrapolateDabs", () => {
-  it("予測点まで間隔どおりに並ぶ", () => {
-    const predicted = Float32Array.from([10, 0, 0.5, 0, 20, 0, 0.5, 0]);
-    const dabs = extrapolateDabs(0, 0, 4, 1, 0.5, predicted);
+  const last = [0, 0, 4, 1, 0.5, 0.75, 123, 0];
+  it("予測点まで間隔どおりに並び、直前のダブの属性を引き継ぐ", () => {
+    const predicted = Float32Array.from([10, 0, 0.5, 0, 0, 0, 20, 0, 0.5, 0, 0, 0]);
+    const dabs = extrapolateDabs(last, 0.5, predicted);
     const xs: number[] = [];
-    for (let i = 0; i < dabs.length; i += 4) xs.push(dabs[i]!);
+    for (let i = 0; i < dabs.length; i += DAB_STRIDE) xs.push(dabs[i]!);
     expect(xs).toEqual([2, 4, 6, 8, 10, 12, 14, 16, 18, 20]);
     expect(dabs[2]).toBe(4);
+    expect(dabs[4]).toBe(0.5);
+    expect(dabs[5]).toBe(0.75);
+    expect(dabs[6]).toBe(123);
   });
   it("上限で止まる", () => {
-    const predicted = Float32Array.from([1000, 0, 0.5, 0]);
-    const dabs = extrapolateDabs(0, 0, 1, 1, 0.5, predicted, 10);
-    expect(dabs.length).toBe(40);
+    const predicted = Float32Array.from([1000, 0, 0.5, 0, 0, 0]);
+    const dabs = extrapolateDabs([0, 0, 1, 1, 0, 1, 0, 0], 0.5, predicted, 10);
+    expect(dabs.length).toBe(10 * DAB_STRIDE);
   });
   it("空の予測なら空", () => {
-    expect(extrapolateDabs(0, 0, 4, 1, 0.5, new Float32Array(0)).length).toBe(0);
+    expect(extrapolateDabs(last, 0.5, new Float32Array(0)).length).toBe(0);
+  });
+});
+
+describe("fillDabColor", () => {
+  it("7 番目だけを書き換える", () => {
+    const d = Float32Array.from([1, 2, 3, 4, 5, 6, 0, 0, 9, 9, 9, 9, 9, 9, 0, 0]);
+    fillDabColor(d, 77);
+    expect(d[6]).toBe(77);
+    expect(d[14]).toBe(77);
+    expect(d[7]).toBe(0);
+    expect(d[8]).toBe(9);
   });
 });

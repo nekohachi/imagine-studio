@@ -8,7 +8,8 @@
 import { PalmGuard, PointPacker, SpeedPressure, normalizePressure } from "./input";
 import {
   POINT_STRIDE,
-  type BrushSettings,
+  type BrushJson,
+  type BrushPreset,
   type FromWorker,
   type LayerInfo,
   type Stats,
@@ -52,8 +53,11 @@ window.addEventListener("resize", () => {
 });
 
 // ---- ブラシ設定 ----
+// ブラシは JSON の定義(brush-core の BrushDef)。スライダーはその一部を直接触る。
+// ブラシスタジオの UI はフェーズ 3。今は JSON の欄で全部の項目を触れるようにしてある。
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const inputs = {
+  preset: $<HTMLSelectElement>("preset"),
   radius: $<HTMLInputElement>("radius"),
   stab: $<HTMLInputElement>("stab"),
   hard: $<HTMLInputElement>("hard"),
@@ -64,6 +68,18 @@ const inputs = {
   color: $<HTMLInputElement>("color"),
   layer: $<HTMLSelectElement>("layer"),
   visible: $<HTMLInputElement>("visible"),
+  json: $<HTMLTextAreaElement>("brushJson"),
+  jsonBox: $<HTMLElement>("brushJsonBox"),
+};
+
+let presets: BrushPreset[] = [];
+let def: BrushJson = {
+  name: "ブラシ",
+  size: 6,
+  stabilizer: 8,
+  hardness: 0.7,
+  opacity: 1,
+  eraser: false,
 };
 
 function hexToRgb(hex: string): [number, number, number] {
@@ -71,29 +87,77 @@ function hexToRgb(hex: string): [number, number, number] {
   return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
 }
 
-function readBrush(): BrushSettings {
-  return {
-    radius: Number(inputs.radius.value),
-    stabilizer: Number(inputs.stab.value),
-    hardness: Number(inputs.hard.value),
-    opacity: Number(inputs.opacity.value),
-    flow: 0.9,
-    spacing: 0.2,
-    color: hexToRgb(inputs.color.value),
-    eraser: inputs.eraser.checked,
-  };
+/** def をスライダーと JSON 欄に映す。 */
+function showDef(): void {
+  inputs.radius.value = String(def.size);
+  inputs.stab.value = String(def.stabilizer);
+  inputs.hard.value = String(def.hardness);
+  inputs.opacity.value = String(def.opacity);
+  inputs.eraser.checked = Boolean(def.eraser);
+  $("radiusV").textContent = String(def.size);
+  $("stabV").textContent = String(def.stabilizer);
+  $("hardV").textContent = String(def.hardness);
+  $("opacityV").textContent = String(def.opacity);
+  if (document.activeElement !== inputs.json) inputs.json.value = JSON.stringify(def, null, 2);
 }
 
 function pushBrush(): void {
-  $("radiusV").textContent = inputs.radius.value;
-  $("stabV").textContent = inputs.stab.value;
-  $("hardV").textContent = inputs.hard.value;
-  $("opacityV").textContent = inputs.opacity.value;
-  send({ type: "brush", brush: readBrush() });
+  send({ type: "brush", brush: { json: JSON.stringify(def), color: hexToRgb(inputs.color.value) } });
 }
-for (const el of [inputs.radius, inputs.stab, inputs.hard, inputs.opacity, inputs.color, inputs.eraser]) {
-  el.addEventListener("input", pushBrush);
+
+function readSliders(): void {
+  def.size = Number(inputs.radius.value);
+  def.stabilizer = Number(inputs.stab.value);
+  def.hardness = Number(inputs.hard.value);
+  def.opacity = Number(inputs.opacity.value);
+  def.eraser = inputs.eraser.checked;
+  showDef();
+  pushBrush();
 }
+for (const el of [inputs.radius, inputs.stab, inputs.hard, inputs.opacity, inputs.eraser]) {
+  el.addEventListener("input", readSliders);
+}
+inputs.color.addEventListener("input", pushBrush);
+
+inputs.preset.addEventListener("change", () => {
+  const p = presets[Number(inputs.preset.value)];
+  if (!p) return;
+  def = JSON.parse(p.json) as BrushJson;
+  showDef();
+  pushBrush();
+});
+
+$("brushJsonToggle").addEventListener("click", () => {
+  inputs.jsonBox.hidden = !inputs.jsonBox.hidden;
+});
+$("brushJsonApply").addEventListener("click", () => {
+  try {
+    def = JSON.parse(inputs.json.value) as BrushJson;
+    showDef();
+    pushBrush();
+  } catch (e) {
+    showError("ブラシ JSON が読めない: " + String(e));
+  }
+});
+
+function applyPresets(list: BrushPreset[]): void {
+  presets = list;
+  inputs.preset.innerHTML = "";
+  list.forEach((p, i) => {
+    const o = document.createElement("option");
+    o.value = String(i);
+    o.textContent = p.name;
+    inputs.preset.appendChild(o);
+  });
+  // 既定はペン
+  const idx = Math.max(0, list.findIndex((p) => p.name === "ペン"));
+  inputs.preset.value = String(idx);
+  const p = list[idx];
+  if (p) def = JSON.parse(p.json) as BrushJson;
+  showDef();
+  pushBrush();
+}
+showDef();
 pushBrush();
 $("undo").addEventListener("click", () => send({ type: "undo" }));
 $("redo").addEventListener("click", () => send({ type: "redo" }));
@@ -220,7 +284,7 @@ function pressureOf(e: PointerEvent, x: number, y: number): number {
 
 function addPoint(e: PointerEvent): void {
   const [x, y] = toDoc(e);
-  packer.push(x, y, pressureOf(e, x, y), e.timeStamp);
+  packer.push(x, y, pressureOf(e, x, y), e.timeStamp, e.tiltX, e.tiltY);
   inputStats.events++;
 }
 
@@ -380,7 +444,7 @@ function renderHud(): void {
   const avg = frameHist.length ? frameHist.reduce((a, b) => a + b, 0) / frameHist.length : 0;
   const max = frameHist.length ? Math.max(...frameHist) : 0;
   hud.textContent = [
-    `Imagine Studio · Phase 1 · ${__BUILD__}`,
+    `Imagine Studio · Phase 2 · ${__BUILD__}`,
     `wasm ${ready.version}  ${ready.renderer.slice(0, 40)}`,
     `desync ${ready.desynchronized ? "on" : "off"}  raw ${hasRawUpdate ? "on" : "off"}  predict ${hasPredicted ? "on" : "off"}  dpr ${dpr}`,
     `doc ${DOC_W}×${DOC_H}  zoom ${(view.scale * 100).toFixed(0)}%  rot ${((view.rot * 180) / Math.PI).toFixed(0)}°`,
@@ -401,6 +465,7 @@ worker.onmessage = (e: MessageEvent<FromWorker>) => {
   switch (m.type) {
     case "ready":
       ready = m;
+      applyPresets(m.presets);
       applyLayers(m.layers, m.active);
       if (m.docW !== DOC_W || m.docH !== DOC_H) setDocSize(m.docW, m.docH);
       renderHud();

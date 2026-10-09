@@ -1,12 +1,12 @@
 // 入力まわりの純粋な部品。DOM に触らないのでそのまま vitest で試せる。
-import { POINT_STRIDE } from "./protocol";
+import { DAB_STRIDE, POINT_STRIDE } from "./protocol";
 
 /** フレームごとに入力点を溜めて、まとめてワーカーへ転送するための袋。 */
 export class PointPacker {
   private buf = new Float32Array(POINT_STRIDE * 256);
   private n = 0;
 
-  push(x: number, y: number, pressure: number, time: number): void {
+  push(x: number, y: number, pressure: number, time: number, tiltX = 0, tiltY = 0): void {
     if ((this.n + 1) * POINT_STRIDE > this.buf.length) {
       const next = new Float32Array(this.buf.length * 2);
       next.set(this.buf);
@@ -17,6 +17,8 @@ export class PointPacker {
     this.buf[o + 1] = y;
     this.buf[o + 2] = pressure;
     this.buf[o + 3] = time;
+    this.buf[o + 4] = tiltX;
+    this.buf[o + 5] = tiltY;
     this.n++;
   }
 
@@ -81,23 +83,21 @@ export function normalizePressure(pointerType: string, raw: number): number {
 }
 
 /**
- * 予測点の仮描画用。最後に確定したダブから予測点まで、間隔どおりに円を並べる。
+ * 予測点の仮描画用。最後に確定したダブから予測点まで、間隔どおりに同じダブを並べる。
  * brush-core を通さない(予測点でエンジンの状態を汚さないため)。
- * 戻り値は [x, y, radius, opacity] × n。
+ * `last` は直前のダブ(DAB_STRIDE 要素)。戻り値はダブ × n。
  */
 export function extrapolateDabs(
-  fromX: number,
-  fromY: number,
-  radius: number,
-  opacity: number,
+  last: ArrayLike<number>,
   spacing: number,
   predicted: Float32Array,
   maxDabs = 64
 ): Float32Array {
+  const radius = last[2] ?? 1;
   const step = Math.max(0.5, radius * spacing);
   const out: number[] = [];
-  let px = fromX;
-  let py = fromY;
+  let px = last[0] ?? 0;
+  let py = last[1] ?? 0;
   let carry = step;
   for (let i = 0; i + 1 < predicted.length; i += POINT_STRIDE) {
     const qx = predicted[i]!;
@@ -109,13 +109,20 @@ export function extrapolateDabs(
     let d = carry;
     while (d <= len) {
       const t = d / len;
-      out.push(px + dx * t, py + dy * t, radius, opacity);
+      out.push(px + dx * t, py + dy * t);
+      for (let k = 2; k < DAB_STRIDE; k++) out.push(last[k] ?? 0);
       d += step;
-      if (out.length / 4 >= maxDabs) return Float32Array.from(out);
+      if (out.length / DAB_STRIDE >= maxDabs) return Float32Array.from(out);
     }
     carry = d - len;
     px = qx;
     py = qy;
   }
   return Float32Array.from(out);
+}
+
+/** ダブ列の 7 番目(色)を全部同じ値にする。 */
+export function fillDabColor(dabs: Float32Array, packed: number): Float32Array {
+  for (let i = 6; i < dabs.length; i += DAB_STRIDE) dabs[i] = packed;
+  return dabs;
 }
