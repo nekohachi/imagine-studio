@@ -458,7 +458,9 @@ export function renderLayersPanel(body: HTMLElement, ctx: Ctx): void {
     const eye = document.createElement("button");
     eye.className = "lyeye";
     eye.innerHTML = svgIcon(l.visible ? "eye" : "eyeOff", 18);
-    eye.addEventListener("click", (e) => {
+    // 行の touchstart の preventDefault で click が来ないので pointer で見る。行の長押しにも渡さない
+    eye.addEventListener("pointerdown", (e) => e.stopPropagation());
+    eye.addEventListener("pointerup", (e) => {
       e.stopPropagation();
       bridge.send({ type: "setLayerVisible", id: l.id, visible: !l.visible });
     });

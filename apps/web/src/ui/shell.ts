@@ -28,8 +28,48 @@ function iconButton(id: string, icon: IconName, label: string, extraClass = ""):
   b.title = label;
   b.setAttribute("aria-label", label);
   b.innerHTML = svgIcon(icon) + `<span class="ibtn-label">${label}</span>`;
+  // touchstart の preventDefault(iOS の長押しメニューと二度押しズームを止める)は、
+  // 指とペンの click も止めてしまう。pointer でタップを見て click を自分で起こす
   b.addEventListener("touchstart", (e) => e.preventDefault(), { passive: false });
   b.addEventListener("contextmenu", (e) => e.preventDefault());
+  let pid: number | null = null;
+  let sx = 0;
+  let sy = 0;
+  b.addEventListener("pointerdown", (e) => {
+    if (e.pointerType === "mouse") return;
+    pid = e.pointerId;
+    sx = e.clientX;
+    sy = e.clientY;
+    try {
+      b.setPointerCapture(e.pointerId);
+    } catch {
+      /* 取れなくても動く */
+    }
+  });
+  let suppressUntil = 0;
+  b.addEventListener("pointerup", (e) => {
+    if (e.pointerId !== pid) return;
+    pid = null;
+    if (b.disabled) return;
+    if (Math.hypot(e.clientX - sx, e.clientY - sy) < 14) {
+      // 環境によっては本物の click も続けて来る(Windows のペンなど)。二重にしない
+      suppressUntil = performance.now() + 500;
+      b.click();
+    }
+  });
+  b.addEventListener(
+    "click",
+    (e) => {
+      if (e.isTrusted && performance.now() < suppressUntil) {
+        e.stopImmediatePropagation();
+        e.preventDefault();
+      }
+    },
+    { capture: true }
+  );
+  b.addEventListener("pointercancel", () => {
+    pid = null;
+  });
   return b;
 }
 
