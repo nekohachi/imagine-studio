@@ -15,6 +15,13 @@ import type { View } from "./protocol";
 
 export const TILE = 256;
 
+/** ダブの見た目のうち、ブラシ単位で決まるもの(ダブごとに変わるものはインスタンス属性)。 */
+export interface DabLook {
+  hardness: number;
+  grain: number;
+  grainScale: number;
+}
+
 const DAB_VS = `#version 300 es
 precision highp float;
 layout(location=0) in vec2 corner;      // -1..1 の四角
@@ -25,6 +32,7 @@ out vec2 vUv;
 out float vRadius;
 out float vOpacity;
 out vec3 vColor;
+out vec2 vDoc;
 void main() {
   // 1px 未満の細い線は、半径を 0.75 に留めて不透明度で面積を表す(点々にならない)
   float r0 = dab.z;
@@ -37,6 +45,7 @@ void main() {
   vec2 p = dab.xy + vec2(c * local.x - s * local.y, s * local.x + c * local.y);
   vec2 ndc = (p / uSize) * 2.0 - 1.0;
   gl_Position = vec4(ndc, 0.0, 1.0);
+  vDoc = p;
   vUv = corner * rr;                    // 扁平は形で表し、距離は円のまま測る
   vRadius = r;
   vOpacity = dab.w * cov;
@@ -53,14 +62,35 @@ in vec2 vUv;
 in float vRadius;
 in float vOpacity;
 in vec3 vColor;
+in vec2 vDoc;
 uniform float uHardness;
+uniform float uGrain;        // 紙目の強さ 0..1
+uniform float uGrainScale;   // 紙目の大きさ px
 out vec4 o;
+float hash2(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+// キャンバス固定の値ノイズ(2 オクターブ)。同じ場所は同じ目になる
+float grain(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = mix(mix(hash2(i), hash2(i + vec2(1, 0)), u.x), mix(hash2(i + vec2(0, 1)), hash2(i + vec2(1, 1)), u.x), u.y);
+  vec2 p2 = p * 2.3 + 17.0;
+  vec2 i2 = floor(p2);
+  vec2 f2 = fract(p2);
+  vec2 u2 = f2 * f2 * (3.0 - 2.0 * f2);
+  float b = mix(mix(hash2(i2), hash2(i2 + vec2(1, 0)), u2.x), mix(hash2(i2 + vec2(0, 1)), hash2(i2 + vec2(1, 1)), u2.x), u2.y);
+  return a * 0.65 + b * 0.35;
+}
 void main() {
   float d = length(vUv);
   float r = vRadius;
   // hardness=1 で 1.5px の AA、hardness=0 で中心から薄くなる
   float edge0 = min(r * uHardness, max(r - 1.5, 0.0));
   float a = (1.0 - smoothstep(edge0, r, d)) * vOpacity;
+  if (uGrain > 0.0) {
+    float g = grain(vDoc / uGrainScale);
+    a *= 1.0 - uGrain * g;
+  }
   o = vec4(vColor * a, a);
 }`;
 
@@ -192,7 +222,9 @@ export class Renderer {
     const gl = this.gl;
     this.dabProg = this.program(DAB_VS, DAB_FS);
     this.blitProg = this.program(BLIT_VS, BLIT_FS);
-    for (const n of ["uSize", "uHardness"]) this.u[n] = gl.getUniformLocation(this.dabProg, n)!;
+    for (const n of ["uSize", "uHardness", "uGrain", "uGrainScale"]) {
+      this.u[n] = gl.getUniformLocation(this.dabProg, n)!;
+    }
     for (const n of ["uDoc", "uM", "uTex", "uOpacity", "uDither", "uMode", "uSolid"]) {
       this.u[n] = gl.getUniformLocation(this.blitProg, n)!;
     }
@@ -367,16 +399,16 @@ export class Renderer {
   }
 
   /** ダブは DAB_STRIDE(8)要素ずつ。色は 7 番目に詰めてある。 */
-  drawDabs(dabs: Float32Array, hardness: number): void {
-    this.drawDabsTo(this.stroke, dabs, hardness);
+  drawDabs(dabs: Float32Array, look: DabLook): void {
+    this.drawDabsTo(this.stroke, dabs, look);
   }
 
-  drawPredicted(dabs: Float32Array, hardness: number): void {
+  drawPredicted(dabs: Float32Array, look: DabLook): void {
     this.clearTarget(this.predict);
-    if (dabs.length) this.drawDabsTo(this.predict, dabs, hardness);
+    if (dabs.length) this.drawDabsTo(this.predict, dabs, look);
   }
 
-  private drawDabsTo(t: Target | null, dabs: Float32Array, hardness: number): void {
+  private drawDabsTo(t: Target | null, dabs: Float32Array, look: DabLook): void {
     const n = (dabs.length / 8) | 0;
     if (!t || n === 0) return;
     const gl = this.gl;
@@ -384,7 +416,9 @@ export class Renderer {
     gl.viewport(0, 0, t.w, t.h);
     gl.useProgram(this.dabProg);
     gl.uniform2f(this.u.uSize!, t.w, t.h);
-    gl.uniform1f(this.u.uHardness!, hardness);
+    gl.uniform1f(this.u.uHardness!, look.hardness);
+    gl.uniform1f(this.u.uGrain!, look.grain);
+    gl.uniform1f(this.u.uGrainScale!, Math.max(0.5, look.grainScale));
     gl.bindVertexArray(this.dabVao);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.dabVbo);
     gl.bufferData(gl.ARRAY_BUFFER, dabs, gl.STREAM_DRAW);

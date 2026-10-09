@@ -4,10 +4,10 @@
 import init, { Brush, Doc, Stroke, version } from "./wasm/imagine_wasm.js";
 import wasmUrl from "./wasm/imagine_wasm_bg.wasm?url";
 import { Renderer } from "./gl";
-import { extrapolateDabs, fillDabColor } from "./input";
+import { extrapolateDabs } from "./input";
+import type { DabLook } from "./gl";
 import {
   DAB_STRIDE,
-  packColor,
   type BrushPreset,
   type FromWorker,
   type LayerInfo,
@@ -25,7 +25,7 @@ let renderer: Renderer | null = null;
 let doc: Doc | null = null;
 let brush: Brush | null = null;
 let brushJson = "{}";
-let color = packColor([0.1, 0.1, 0.1]);
+let colorRgb: [number, number, number] = [0.1, 0.1, 0.1];
 let view: View = { scale: 1, tx: 0, ty: 0, rot: 0 };
 let active = 0;
 let stroke: Stroke | null = null;
@@ -58,6 +58,14 @@ function presets(): BrushPreset[] {
 
 function brushOpacity(): number {
   return brush ? brush.opacity : 1;
+}
+
+function look(): DabLook {
+  return {
+    hardness: brush?.hardness ?? 0.7,
+    grain: brush?.grain ?? 0,
+    grainScale: brush?.grain_scale ?? 3,
+  };
 }
 
 function layerInfos(): LayerInfo[] {
@@ -288,37 +296,37 @@ async function handle(m: ToWorker): Promise<void> {
       return;
     case "brush":
       brushJson = m.brush.json;
-      color = packColor(m.brush.color);
+      colorRgb = m.brush.color;
       applyBrush();
       return;
     case "begin": {
-      if (!renderer || !brush) return;
+      if (!renderer || !brush || !doc) return;
       if (stroke) {
-        stroke.finish();
+        stroke.finish(doc, active);
         stroke.free();
       }
-      stroke = new Stroke(brush);
+      stroke = new Stroke(brush, colorRgb[0], colorRgb[1], colorRgb[2]);
       lastDab = null;
       bbox = null;
       renderer.beginStroke();
       return;
     }
     case "points": {
-      if (!renderer || !stroke) return;
+      if (!renderer || !stroke || !doc) return;
       const t0 = performance.now();
       renderer.drawCalls = 0;
-      const hardness = brush?.hardness ?? 0.7;
-      const dabs = fillDabColor(stroke.add_points(m.data), color);
+      const lk = look();
+      const dabs = stroke.add_points(m.data, doc, active);
       if (dabs.length) {
-        renderer.drawDabs(dabs, hardness);
+        renderer.drawDabs(dabs, lk);
         growBbox(dabs);
         lastDab = Array.from(dabs.subarray(dabs.length - DAB_STRIDE));
       }
       if (lastDab && m.predicted.length) {
         const pd = extrapolateDabs(lastDab, brush?.spacing ?? 0.2, m.predicted);
-        renderer.drawPredicted(pd, hardness);
+        renderer.drawPredicted(pd, lk);
       } else {
-        renderer.drawPredicted(new Float32Array(0), hardness);
+        renderer.drawPredicted(new Float32Array(0), lk);
       }
       present(true, true);
       const lastT = m.data.length >= 4 ? m.data[m.data.length - 1]! : 0;
@@ -326,12 +334,12 @@ async function handle(m: ToWorker): Promise<void> {
       return;
     }
     case "end": {
-      if (!renderer || !stroke) return;
+      if (!renderer || !stroke || !doc) return;
       const t0 = performance.now();
       renderer.drawCalls = 0;
-      const dabs = fillDabColor(stroke.finish(), color);
+      const dabs = stroke.finish(doc, active);
       if (dabs.length) {
-        renderer.drawDabs(dabs, brush?.hardness ?? 0.7);
+        renderer.drawDabs(dabs, look());
         growBbox(dabs);
       }
       lastStrokeDabs = stroke.dab_count;

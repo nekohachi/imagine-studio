@@ -12,6 +12,12 @@ pub struct Doc {
     inner: Document,
 }
 
+impl Doc {
+    pub(crate) fn inner(&self) -> &Document {
+        &self.inner
+    }
+}
+
 fn keys_to_array(keys: &[TileKey]) -> js_sys::Int32Array {
     let mut v = Vec::with_capacity(keys.len() * 2);
     for k in keys {

@@ -9,6 +9,9 @@ use crate::{PolyPoint, Stamp};
 /// 速度を 0..1 に正規化するときの上限 (px/秒)
 const FULL_SPEED: f32 = 2000.0;
 
+/// 1 ストロークのダブ数がこれを超えるたびに間隔を 2 倍にする(docs/02 の原則 7)。
+pub const DABS_BEFORE_WIDENING: u32 = 20_000;
+
 /// 決定的な乱数(xorshift32)。同じ入力ログから同じ絵が出るように、ストロークごとに固定の種で始める。
 #[derive(Clone, Copy, Debug)]
 struct Rng(u32);
@@ -39,6 +42,10 @@ pub struct Stamper {
     /// 抜きのために出力を遅らせているダブ(ダブ, その位置の距離)
     pending: VecDeque<(Stamp, f32)>,
     rng: Rng,
+    /// このストロークで打ったダブ数
+    count: u32,
+    /// ダブ数が多すぎるときの間隔の倍率(1, 2, 4, ...)
+    widen: f32,
 }
 
 impl Stamper {
@@ -51,7 +58,14 @@ impl Stamper {
             direction: 0.0,
             pending: VecDeque::new(),
             rng: Rng(0x9E37_79B9),
+            count: 0,
+            widen: 1.0,
         }
+    }
+
+    /// 間隔の倍率(ベンチ表示用)。1 なら制限が効いていない。
+    pub fn widen(&self) -> f32 {
+        self.widen
     }
 
     fn tilt_mag(p: &PolyPoint) -> f32 {
@@ -132,6 +146,10 @@ impl Stamper {
 
     /// 抜きがあるときは、終端から taper_out 以内のダブを保留する。
     fn emit(&mut self, s: Stamp, dist: f32, out: &mut Vec<Stamp>) {
+        self.count += 1;
+        if self.count % DABS_BEFORE_WIDENING == 0 {
+            self.widen *= 2.0;
+        }
         if self.def.taper_out <= 0.0 {
             out.push(s);
             return;
@@ -170,7 +188,8 @@ impl Stamper {
         loop {
             let t_here = traveled / seg_len;
             let here = lerp(&last, &p, t_here);
-            let spacing = (self.def.spacing * self.radius_at(&here, seg_start + traveled)).max(0.25);
+            let spacing =
+                (self.def.spacing * self.radius_at(&here, seg_start + traveled)).max(0.25) * self.widen;
             let need = spacing - self.since_last;
             if traveled + need > seg_len {
                 self.since_last += seg_len - traveled;

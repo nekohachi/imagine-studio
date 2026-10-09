@@ -123,6 +123,14 @@ pub struct BrushDef {
     pub roundness: f32,
     /// 消しゴムとして使う
     pub eraser: bool,
+    /// 混色: キャンバスの色をどれだけ拾うか 0..1(0 で混ぜない)
+    pub mix: f32,
+    /// 水分: 拾った色がどれだけ残るか 0..1(1 で元の色に戻らない)
+    pub wet: f32,
+    /// 紙目(キャンバス固定のノイズ)の強さ 0..1
+    pub grain: f32,
+    /// 紙目の大きさ px
+    pub grain_scale: f32,
 }
 
 impl Default for BrushDef {
@@ -151,6 +159,10 @@ impl Default for BrushDef {
             angle: AngleMode::Fixed(0.0),
             roundness: 1.0,
             eraser: false,
+            mix: 0.0,
+            wet: 0.5,
+            grain: 0.0,
+            grain_scale: 3.0,
         }
     }
 }
@@ -183,6 +195,10 @@ impl BrushDef {
         self.scatter_size = self.scatter_size.clamp(0.0, 1.0);
         self.scatter_opacity = self.scatter_opacity.clamp(0.0, 1.0);
         self.roundness = self.roundness.clamp(0.05, 1.0);
+        self.mix = self.mix.clamp(0.0, 1.0);
+        self.wet = self.wet.clamp(0.0, 1.0);
+        self.grain = self.grain.clamp(0.0, 1.0);
+        self.grain_scale = self.grain_scale.clamp(0.5, 200.0);
         for p in &mut self.pressure_size.points {
             p[0] = p[0].clamp(0.0, 1.0);
             p[1] = p[1].clamp(0.0, 1.0);
@@ -216,6 +232,8 @@ impl BrushDef {
                 scatter_pos: 0.15,
                 scatter_opacity: 0.3,
                 angle: AngleMode::Tilt,
+                grain: 0.6,
+                grain_scale: 2.5,
                 ..base.clone()
             },
             BrushDef {
@@ -273,7 +291,7 @@ impl BrushDef {
                 ..base.clone()
             },
             BrushDef {
-                name: "水彩(仮)".into(),
+                name: "水彩".into(),
                 size: 24.0,
                 size_min: 0.5,
                 spacing: 0.12,
@@ -285,6 +303,27 @@ impl BrushDef {
                 tilt_flatten: 0.4,
                 scatter_opacity: 0.2,
                 angle: AngleMode::Tilt,
+                mix: 0.6,
+                wet: 0.8,
+                grain: 0.3,
+                grain_scale: 6.0,
+                ..base.clone()
+            },
+            BrushDef {
+                name: "油彩".into(),
+                size: 18.0,
+                size_min: 0.7,
+                spacing: 0.08,
+                flow: 0.9,
+                hardness: 0.85,
+                opacity_min: 0.8,
+                tilt_flatten: 0.5,
+                angle: AngleMode::Direction,
+                roundness: 0.5,
+                mix: 0.75,
+                wet: 0.95,
+                grain: 0.15,
+                grain_scale: 4.0,
                 ..base.clone()
             },
             BrushDef {

@@ -166,6 +166,45 @@ impl Document {
         Some(changed)
     }
 
+    /// 1 画素を、下から `upto`(含む)までのレイヤーで合成し、白い紙の上に置いた色と、
+    /// 紙を含まない絵の具の濃さ(アルファ)を返す(0..1)。
+    /// 混色ブラシが「見えている色」を拾うのに使う。紙の部分は白でアルファ 0。範囲外も同じ。
+    pub fn sample_over_white(&self, upto: usize, x: i32, y: i32) -> [f32; 4] {
+        let mut acc = [0u32; 4]; // プリマルチ RGBA、0..255
+        if x >= 0 && y >= 0 && (x as u32) < self.width && (y as u32) < self.height {
+            let r = Rect::new(x, y, 1, 1);
+            for l in self.layers.iter().take(upto + 1) {
+                if !l.visible || l.opacity <= 0.0 {
+                    continue;
+                }
+                let opq = (l.opacity.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+                let px = l.cel.read_rect(r);
+                let (sr, sg, sb, sa) = match l.cel.format() {
+                    PixelFormat::Rgba8 => (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32),
+                    PixelFormat::A8 => (0, 0, 0, px[0] as u32),
+                };
+                let sa = (sa * opq + 127) / 255;
+                if sa == 0 {
+                    continue;
+                }
+                let f = 255 - sa;
+                let src = [sr, sg, sb, sa];
+                for c in 0..4 {
+                    let sc = if c == 3 { sa } else { (src[c] * opq + 127) / 255 };
+                    acc[c] = (sc + (acc[c] * f + 127) / 255).min(255);
+                }
+            }
+        }
+        let a = acc[3] as f32 / 255.0;
+        let w = 1.0 - a;
+        [
+            acc[0] as f32 / 255.0 + w,
+            acc[1] as f32 / 255.0 + w,
+            acc[2] as f32 / 255.0 + w,
+            a,
+        ]
+    }
+
     /// 全レイヤーの画素のメモリ(履歴は含まない)。
     pub fn memory_bytes(&self) -> usize {
         self.layers.iter().map(|l| l.cel.memory_bytes()).sum()
@@ -298,6 +337,26 @@ mod tests {
         assert_eq!(px[3], 255);
         doc.layer_mut(hi).unwrap().visible = false;
         assert_eq!(doc.flatten_rgba8(r)[0], 255);
+    }
+
+    #[test]
+    fn sample_over_white_sees_layers_below_and_paper() {
+        let mut doc = Document::new(64, 64, 1 << 20);
+        let lo = doc.add_layer(PixelFormat::Rgba8, "lo");
+        let hi = doc.add_layer(PixelFormat::Rgba8, "hi");
+        let r = Rect::new(0, 0, 1, 1);
+        doc.composite_stroke(lo, r, &solid(r, [255, 0, 0, 255]), 1.0, Blend::Normal);
+        doc.composite_stroke(hi, r, &solid(r, [0, 0, 255, 255]), 0.5, Blend::Normal);
+        // 紙(透明)は白で、絵の具の濃さは 0
+        assert_eq!(doc.sample_over_white(1, 5, 5), [1.0, 1.0, 1.0, 0.0]);
+        assert_eq!(doc.sample_over_white(1, -1, 0), [1.0, 1.0, 1.0, 0.0]);
+        // 下だけ見ると赤
+        let lo_only = doc.sample_over_white(0, 0, 0);
+        assert!((lo_only[0] - 1.0).abs() < 0.01 && lo_only[2] < 0.01, "{lo_only:?}");
+        assert_eq!(lo_only[3], 1.0);
+        // 上まで見ると赤と青の半々
+        let both = doc.sample_over_white(1, 0, 0);
+        assert!((both[0] - 0.5).abs() < 0.02 && (both[2] - 0.5).abs() < 0.02, "{both:?}");
     }
 
     #[test]
