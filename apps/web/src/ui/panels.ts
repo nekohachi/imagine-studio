@@ -281,6 +281,26 @@ export function renderBrushPanel(body: HTMLElement, ctx: Ctx): void {
   }
   body.append(list);
 
+  // ベクターレイヤーでの消しゴムの種類
+  if (state.activeLayer()?.vector) {
+    body.append(el.title("ベクター消しゴム(消しゴムで線を消すとき)"));
+    const row = el.row();
+    for (const [mode, label, sub] of [
+      [0, "通常", "触れた所を切る"],
+      [1, "触れた線", "丸ごと消す"],
+      [2, "交点まで", "他の線と交わる所まで"],
+    ] as const) {
+      const btn = el.button(label, () => {
+        state.vectorErase = mode;
+        act.setBrushJson(state.brush);
+        ctx.shell.rerender();
+      }, "eraser", state.vectorErase === mode ? "on" : "");
+      btn.title = sub;
+      row.append(btn);
+    }
+    body.append(row);
+  }
+
   // 今のブラシの主な数値
   const b = state.brush;
   body.append(el.title(`${b.name} の設定`));
@@ -431,7 +451,26 @@ export function setThumbnails(size: number, items: Array<{ id: number; bitmap: I
 export function renderLayersPanel(body: HTMLElement, ctx: Ctx): void {
   const { state, bridge, act } = ctx;
   const head = el.row(el.title("レイヤー"));
-  const addBtn = el.button("追加", () => bridge.send({ type: "addLayer", a8: false, name: `レイヤー ${state.layers.length + 1}` }), "plus");
+  const n = state.layers.length + 1;
+  const addRaster = () => bridge.send({ type: "addLayer", a8: false, name: `レイヤー ${n}` });
+  const addBtn = el.button("追加", () => {}, "plus");
+  addBtn.title = "タップでラスター、長押しで種類を選ぶ";
+  // タップでラスター、長押しの輪で種類(ラスター / モノクロ / ベクター)
+  attachRadialButton(
+    addBtn,
+    () => ({
+      N: { label: "ラスター", sub: "カラー", icon: ICONS.layers, run: addRaster },
+      E: { label: "モノクロ", sub: "A8・線画やトーン", icon: ICONS.layers, run: () => bridge.send({ type: "addLayer", a8: true, name: `モノクロ ${n}` }) },
+      S: { label: "ベクター", sub: "線を後から消せる", icon: ICONS.pen, run: () => bridge.send({ type: "addLayer", a8: false, vector: true, name: `線 ${n}` }) },
+      W: {
+        label: "ベクター(モノクロ)",
+        sub: "漫画の線画に",
+        icon: ICONS.pen,
+        run: () => bridge.send({ type: "addLayer", a8: true, vector: true, name: `線画 ${n}` }),
+      },
+    }),
+    addRaster
+  );
   head.append(addBtn);
   body.append(head);
 
@@ -453,7 +492,7 @@ export function renderLayersPanel(body: HTMLElement, ctx: Ctx): void {
     name.className = "lyname";
     const modeName = BLEND_LABELS[state.blendNames[l.blend] ?? "normal"] ?? state.blendNames[l.blend];
     name.innerHTML =
-      `<span>${l.clip ? "↳ " : ""}${l.name}${l.a8 ? "(モノクロ)" : ""}</span>` +
+      `<span>${l.clip ? "↳ " : ""}${l.name}${l.vector ? "(ベクター)" : ""}${l.a8 ? "(モノクロ)" : ""}</span>` +
       `<span class="lysub">${l.blend ? modeName : ""}${l.opacity < 1 ? ` ${Math.round(l.opacity * 100)}%` : ""}</span>`;
     const eye = document.createElement("button");
     eye.className = "lyeye";
@@ -482,6 +521,25 @@ export function renderLayersPanel(body: HTMLElement, ctx: Ctx): void {
         bridge.send({ type: "setLayerOpacity", id: cur.id, opacity: v / 100 });
       })
     );
+    if (cur.vector) {
+      body.append(el.title("線幅(このレイヤーの線すべて)"));
+      body.append(
+        el.row(
+          el.button("太く", () => bridge.send({ type: "vectorWidth", factor: 1.25 }), "plus"),
+          el.button("細く", () => bridge.send({ type: "vectorWidth", factor: 0.8 })),
+          el.button("均一に", () => bridge.send({ type: "vectorUniform" })),
+          el.button("ラスタライズ", () => {
+            if (window.confirm(`「${cur.name}」をラスターにしますか? 線単位の編集はできなくなります。`)) {
+              bridge.send({ type: "layerOp", op: "rasterize", id: cur.id });
+            }
+          }, "layers")
+        )
+      );
+      const help = document.createElement("div");
+      help.className = "phelp";
+      help.textContent = "ベクターレイヤー: 線は点列で持ち、消しゴムは線単位で効きます(ブラシパネルで種類を選べます)。塗り・変形・色調補正は「ラスタライズ」してから。";
+      body.append(help);
+    }
   }
   act.thumbnails();
 }

@@ -7,20 +7,39 @@ use std::collections::VecDeque;
 
 use crate::cel::Snapshot;
 use crate::document::LayerId;
+use crate::vector::VStroke;
+
+/// ベクターレイヤーの線の入れ替え: 今の `at..at+len` を `old` に差し替える。
+pub struct Splice {
+    pub at: usize,
+    pub len: usize,
+    pub old: Vec<VStroke>,
+}
 
 pub struct Entry {
     pub label: String,
     pub layer: LayerId,
     /// 入れ替え用の状態(undo 側では「変更前」、redo 側では「変更後」)
     pub tiles: Snapshot,
+    /// ベクターレイヤーなら、線の入れ替え
+    pub vector: Option<Splice>,
 }
 
 impl Entry {
     pub fn bytes(&self) -> usize {
-        self.tiles
+        let tiles: usize = self
+            .tiles
             .iter()
             .map(|(_, t)| t.as_ref().map_or(0, |t| t.bytes()) + 16)
-            .sum()
+            .sum();
+        let vec: usize = self
+            .vector
+            .as_ref()
+            .map_or(0, |s| s.old.iter().map(|v| v.bytes()).sum::<usize>() + 32);
+        tiles + vec
+    }
+    pub fn is_empty(&self) -> bool {
+        self.tiles.is_empty() && self.vector.is_none()
     }
 }
 
@@ -66,7 +85,7 @@ impl History {
 
     /// 新しい操作。redo は捨てる。空の差分は積まない。
     pub fn push(&mut self, entry: Entry) {
-        if entry.tiles.is_empty() {
+        if entry.is_empty() {
             return;
         }
         for e in self.redo.drain(..) {
@@ -125,6 +144,7 @@ mod tests {
             tiles: (0..n)
                 .map(|i| (TileKey::new(i as i32, 0), Some(Tile::empty(PixelFormat::A8))))
                 .collect(),
+            vector: None,
         }
     }
 

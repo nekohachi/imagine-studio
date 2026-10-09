@@ -4,8 +4,39 @@
 //! 眺めは wasm メモリが伸びると無効になるので、受け取ったらすぐ texSubImage2D に渡し、
 //! 持ち越さないこと。
 
-use canvas_core::{Blend, BlendMode, Document, PixelFormat, Rect, SelectMode, TileKey};
+use brush_core::{BrushDef, InputPoint, StrokeEngine};
+use canvas_core::{Blend, BlendMode, Document, EraseMode, PixelFormat, Rect, SelectMode, TileKey, VStroke, VPOINT};
 use wasm_bindgen::prelude::*;
+
+/// ベクターレイヤーの線からダブ列を作る(描き直し用)。戻り値は (ダブ, 硬さ, 不透明度)。
+/// 入力ログが同じなら同じ絵になる(散布の乱数も線ごとに固定の種)。
+pub(crate) fn dabs_of(s: &VStroke) -> (Vec<f32>, f32, f32) {
+    let def = BrushDef::from_json(&s.brush).unwrap_or_default().sanitized();
+    let packed = s.color[0] as f32 * 65536.0 + s.color[1] as f32 * 256.0 + s.color[2] as f32;
+    let mut engine = StrokeEngine::begin(&def);
+    let mut out = Vec::with_capacity(s.len() * 8);
+    let mut push = |stamps: &[brush_core::Stamp]| {
+        for st in stamps {
+            out.extend_from_slice(&[st.x, st.y, st.radius, st.opacity, st.angle, st.aspect, packed, 0.0]);
+        }
+    };
+    for p in s.points.chunks_exact(VPOINT) {
+        let stamps = engine.add_point(InputPoint {
+            x: p[0],
+            y: p[1],
+            pressure: p[2],
+            time: p[3] as f64,
+            tilt_x: p[4],
+            tilt_y: p[5],
+        });
+        push(&stamps);
+    }
+    if engine.is_active() {
+        let stamps = engine.finish();
+        push(&stamps);
+    }
+    (out, def.hardness, def.opacity)
+}
 
 #[wasm_bindgen]
 pub struct Doc {
@@ -72,6 +103,82 @@ impl Doc {
     pub fn add_layer(&mut self, a8: bool, name: &str) -> u32 {
         let f = if a8 { PixelFormat::A8 } else { PixelFormat::Rgba8 };
         self.inner.add_layer(f, name)
+    }
+
+    /// 一番上にベクターレイヤーを足す。
+    pub fn add_vector_layer(&mut self, a8: bool, name: &str) -> u32 {
+        let f = if a8 { PixelFormat::A8 } else { PixelFormat::Rgba8 };
+        self.inner.add_vector_layer(f, name)
+    }
+
+    pub fn layer_vector(&self, id: u32) -> bool {
+        self.inner.layer(id).is_some_and(|l| l.is_vector())
+    }
+
+    pub fn rasterize_layer(&mut self, id: u32) -> bool {
+        self.inner.rasterize_layer(id)
+    }
+
+    pub fn vector_count(&self, id: u32) -> u32 {
+        self.inner.vector_strokes(id).map_or(0, |v| v.len() as u32)
+    }
+
+    /// ベクターレイヤーに線を 1 本足して CPU で焼く。`points` は [x, y, 筆圧, 時刻, 傾き x, 傾き y] × n、
+    /// 色は 0..255。戻り値は変わったタイル。
+    pub fn vector_add_stroke(&mut self, layer: u32, brush_json: &str, r: u8, g: u8, b: u8, points: &[f32]) -> js_sys::Int32Array {
+        let n = points.len() / VPOINT;
+        if n == 0 {
+            return js_sys::Int32Array::new_with_length(0);
+        }
+        // 時刻は最初の点からの相対にして f32 の桁を保つ
+        let t0 = points[3];
+        let mut pts = points[..n * VPOINT].to_vec();
+        for p in pts.chunks_exact_mut(VPOINT) {
+            p[3] -= t0;
+        }
+        let stroke = VStroke {
+            brush: brush_json.to_string(),
+            color: [r, g, b],
+            points: pts,
+        };
+        let (dabs, hardness, opacity) = dabs_of(&stroke);
+        keys_to_array(&self.inner.vector_add_stroke(layer, stroke, &dabs, hardness, opacity))
+    }
+
+    /// ベクター消しゴム。`mode` 0 通常、1 触れた線を消す、2 交点まで。何も触れなければ長さ 0。
+    pub fn vector_erase(&mut self, layer: u32, path: &[f32], radius: f32, mode: u32) -> js_sys::Int32Array {
+        match self.inner.vector_erase(layer, path, radius, EraseMode::from_u32(mode), dabs_of) {
+            Some(keys) => keys_to_array(&keys),
+            None => js_sys::Int32Array::new_with_length(0),
+        }
+    }
+
+    /// 線幅を倍率で変える(全部描き直す)。
+    pub fn vector_scale_width(&mut self, layer: u32, factor: f32) -> js_sys::Int32Array {
+        let f = factor.clamp(0.1, 10.0);
+        keys_to_array(&self.inner.vector_edit_all(
+            layer,
+            "線幅",
+            |s| {
+                let z = s.size() * f;
+                s.set_brush_number("size", z.clamp(0.1, 1000.0));
+            },
+            dabs_of,
+        ))
+    }
+
+    /// 線幅を均一にする(筆圧で太さを変えない)。
+    pub fn vector_uniform_width(&mut self, layer: u32) -> js_sys::Int32Array {
+        keys_to_array(&self.inner.vector_edit_all(
+            layer,
+            "線幅を均一に",
+            |s| {
+                s.set_brush_number("size_min", 1.0);
+                s.set_brush_number("taper_in", 0.0);
+                s.set_brush_number("taper_out", 0.0);
+            },
+            dabs_of,
+        ))
     }
 
     /// レイヤー id の並び(下から上)。

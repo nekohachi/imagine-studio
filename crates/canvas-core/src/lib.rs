@@ -18,8 +18,10 @@ pub mod io;
 pub mod selection;
 pub mod tile;
 pub mod transform;
+pub mod vector;
 
 pub use adjust::{gaussian_blur, unsharp, Adjust};
+pub use vector::{DabBuf, EraseMode, VStroke, VDAB, VPOINT};
 pub use blend::{composite_pixel, BlendMode};
 pub use cel::{Blend, Cel};
 pub use document::{Document, Layer, LayerId};

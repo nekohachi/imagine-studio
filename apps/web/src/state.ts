@@ -79,6 +79,8 @@ export class AppState {
   /** 自動選択と塗りで見えている絵を参照する(偽なら編集中レイヤー) */
   sampleMerged = true;
   hasSelection = false;
+  /** ベクターレイヤーでの消しゴム: 0 通常、1 触れた線を消す、2 交点まで消す */
+  vectorErase = 0;
   /** 調整パネルで仮表示中のパラメータ。閉じたら null */
   adjust: AdjustParams | null = null;
   /** フィルタの半径(px)とシャープの強さ */

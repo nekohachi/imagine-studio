@@ -59,7 +59,7 @@ const mods = new Modifiers();
 
 // ---- ブラシと色 ----
 function pushBrush(): void {
-  bridge.send({ type: "brush", brush: { json: JSON.stringify(state.brush), color: state.color } });
+  bridge.send({ type: "brush", brush: { json: JSON.stringify(state.brush), color: state.color, vectorErase: state.vectorErase } });
   state.emit("brush");
 }
 
@@ -100,7 +100,7 @@ function setColor(c: Rgb, remember = false): void {
     state.settings.recentColors = [hex, ...state.settings.recentColors.filter((h) => h !== hex)].slice(0, 12);
   }
   state.save();
-  bridge.send({ type: "brush", brush: { json: JSON.stringify(state.brush), color: state.color } });
+  bridge.send({ type: "brush", brush: { json: JSON.stringify(state.brush), color: state.color, vectorErase: state.vectorErase } });
   state.emit("color");
 }
 
@@ -458,6 +458,7 @@ bridge.on("stats", (m) => {
   renderHud();
   if (shell.panelOpen() === "layers" && m.stats.bakeMs > 0) requestThumbnails();
 });
+bridge.on("toast", (m) => shell.toast(m.message, 2600));
 bridge.on("png", (m) => download(m.blob, `imagine-${Date.now()}.png`));
 bridge.on("file", (m) => download(new Blob([m.bytes], { type: "application/zip" }), `imagine-${Date.now()}.imst`));
 

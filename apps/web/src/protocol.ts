@@ -38,6 +38,8 @@ export interface BrushSettings {
   /** brush-core の BrushDef の JSON */
   json: string;
   color: [number, number, number];
+  /** ベクターレイヤーでの消しゴム: 0 通常(触れた所を切る)、1 触れた線を消す、2 交点まで消す */
+  vectorErase: number;
 }
 
 export interface BrushPreset {
@@ -54,6 +56,8 @@ export interface LayerInfo {
   /** 合成モード(blendNames の添字) */
   blend: number;
   clip: boolean;
+  /** ベクターレイヤー(線を持ち、消しゴムは線単位) */
+  vector: boolean;
 }
 
 /** 色調補正のパラメータ(canvas-core の Adjust と同じ形。省いた項目は「変化なし」)。 */
@@ -105,9 +109,11 @@ export type ToWorker =
   | { type: "end" }
   | { type: "cancel" }
   | { type: "setLayer"; id: number }
-  | { type: "addLayer"; a8: boolean; name: string }
+  | { type: "addLayer"; a8: boolean; name: string; vector?: boolean }
+  | { type: "vectorWidth"; factor: number }
+  | { type: "vectorUniform" }
   | { type: "setLayerVisible"; id: number; visible: boolean }
-  | { type: "layerOp"; op: "remove" | "duplicate" | "mergeDown" | "moveUp" | "moveDown"; id: number }
+  | { type: "layerOp"; op: "remove" | "duplicate" | "mergeDown" | "moveUp" | "moveDown" | "rasterize"; id: number }
   | { type: "renameLayer"; id: number; name: string }
   | { type: "setLayerOpacity"; id: number; opacity: number }
   | { type: "setLayerBlend"; id: number; blend: number }
@@ -186,4 +192,5 @@ export type FromWorker =
   | { type: "floating"; rect: [number, number, number, number] | null; failed?: boolean }
   | { type: "sample"; id: number; rgb: [number, number, number]; alpha: number }
   | { type: "readback"; id: number; painted: number }
+  | { type: "toast"; message: string }
   | { type: "error"; message: string };

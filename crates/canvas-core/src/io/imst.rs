@@ -34,7 +34,14 @@ struct LayerJson {
     blend: String,
     #[serde(default)]
     clip: bool,
+    /// ベクターレイヤーなら真。線は pages/0/vectors/<id>.json
+    #[serde(default)]
+    vector: bool,
     tiles: Vec<[i32; 2]>,
+}
+
+fn vector_path(layer: u32) -> String {
+    format!("pages/0/vectors/{layer}.json")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -86,12 +93,17 @@ pub fn save(doc: &Document) -> Vec<u8> {
             format: fmt_name(l.cel.format()).into(),
             blend: l.blend.name().into(),
             clip: l.clip,
+            vector: l.vector.is_some(),
             tiles: keys.iter().map(|k| [k.tx, k.ty]).collect(),
         });
         for k in keys {
             if let Some(t) = l.cel.tile(k) {
                 w.add(&tile_path(l.id, k), &t.data, true);
             }
+        }
+        if let Some(v) = &l.vector {
+            let json = serde_json::to_string(v).unwrap_or_else(|_| "[]".into());
+            w.add(&vector_path(l.id), json.as_bytes(), true);
         }
     }
     w.add("pages/0/page.json", serde_json::to_string_pretty(&page).unwrap().as_bytes(), false);
@@ -121,6 +133,13 @@ pub fn load(bytes: &[u8], history_limit_bytes: usize) -> Result<Document, String
             .ok_or_else(|| format!("レイヤー id {} が重複", lj.id))?;
         layer.blend = crate::blend::BlendMode::parse(&lj.blend).unwrap_or_default();
         layer.clip = lj.clip;
+        if lj.vector {
+            let strokes: Vec<crate::vector::VStroke> = match r.read(&vector_path(lj.id)) {
+                Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("vectors/{}.json: {e}", lj.id))?,
+                Err(_) => Vec::new(),
+            };
+            layer.vector = Some(strokes);
+        }
         for [tx, ty] in &lj.tiles {
             let k = TileKey::new(*tx, *ty);
             let data = r.read(&tile_path(lj.id, k))?;

@@ -4,12 +4,22 @@
 use crate::adjust::{gaussian_blur, unsharp, Adjust};
 use crate::blend::{composite_pixel, BlendMode};
 use crate::cel::{Blend, Cel, Snapshot};
-use crate::history::{Entry, History};
+use crate::history::{Entry, History, Splice};
 use crate::selection::{region_by_color, Mask, SelectMode};
 use crate::tile::{PixelFormat, Rect, TileKey};
 use crate::transform::{resample, Affine, Floating};
+use crate::vector::{DabBuf, EraseMode, VStroke};
 
 pub type LayerId = u32;
+
+/// 2 つ目の差分を 1 つ目に足す。同じタイルは先にあった(より古い)状態を残す。
+fn merge_snapshot(into: &mut Snapshot, more: Snapshot) {
+    for (k, t) in more {
+        if !into.iter().any(|(k2, _)| *k2 == k) {
+            into.push((k, t));
+        }
+    }
+}
 
 pub struct Layer {
     pub id: LayerId,
@@ -21,6 +31,8 @@ pub struct Layer {
     /// 下のレイヤーでクリッピング(下の絵の具がある所だけに描かれる)
     pub clip: bool,
     pub cel: Cel,
+    /// ベクターレイヤーなら線の列(cel はその描画キャッシュ)
+    pub vector: Option<Vec<VStroke>>,
 }
 
 impl Layer {
@@ -33,7 +45,12 @@ impl Layer {
             blend: BlendMode::Normal,
             clip: false,
             cel: Cel::new(format, width, height),
+            vector: None,
         }
+    }
+
+    pub fn is_vector(&self) -> bool {
+        self.vector.is_some()
     }
 
     /// プリマルチ RGBA8 で矩形を読む(A8 は黒インク)。
@@ -329,6 +346,11 @@ impl Document {
             cel.write_rect(Rect::new(dx, dy, old.w, old.h), &px);
             cel.take_dirty();
             l.cel = cel;
+            if let Some(v) = l.vector.as_mut() {
+                for s in v.iter_mut() {
+                    s.translate(dx as f32, dy as f32);
+                }
+            }
         }
         self.width = w;
         self.height = h;
@@ -359,6 +381,11 @@ impl Document {
             cel.write_rect(dst, &out);
             cel.take_dirty();
             l.cel = cel;
+            if let Some(v) = l.vector.as_mut() {
+                for s in v.iter_mut() {
+                    s.scale(m.a, m.d);
+                }
+            }
         }
         self.width = w;
         self.height = h;
@@ -560,6 +587,7 @@ impl Document {
             blend: src.blend,
             clip: src.clip,
             cel,
+            vector: src.vector.clone(),
         };
         self.layers.insert(i + 1, layer);
         Some(new_id)
@@ -592,6 +620,16 @@ impl Document {
         }
         let upper = self.layers.remove(i);
         let lower_id = self.layers[i - 1].id;
+        // 結合先がベクターなら: 上もベクターで通常合成なら線を足す、そうでなければラスターになる
+        if self.layers[i - 1].vector.is_some() {
+            let same = upper.vector.is_some() && upper.blend == BlendMode::Normal && !upper.clip && upper.opacity >= 1.0;
+            if same && upper.visible {
+                let strokes = upper.vector.clone().unwrap_or_default();
+                self.layers[i - 1].vector.as_mut().unwrap().extend(strokes);
+            } else if !(same && !upper.visible) {
+                self.layers[i - 1].vector = None;
+            }
+        }
         if !upper.visible || upper.opacity <= 0.0 {
             return Some((lower_id, Vec::new()));
         }
@@ -629,6 +667,7 @@ impl Document {
                 label: "結合".into(),
                 layer: lower_id,
                 tiles: snap,
+                vector: None,
             });
             all_changed.extend(keys);
         }
@@ -653,6 +692,148 @@ impl Document {
             label: label.to_string(),
             layer,
             tiles: snap,
+            vector: None,
+        });
+        keys
+    }
+
+    // ---- ベクターレイヤー ----
+
+    /// 一番上にベクターレイヤーを足す。
+    pub fn add_vector_layer(&mut self, format: PixelFormat, name: &str) -> LayerId {
+        let id = self.add_layer(format, name);
+        if let Some(l) = self.layer_mut(id) {
+            l.vector = Some(Vec::new());
+        }
+        id
+    }
+
+    pub fn vector_strokes(&self, layer: LayerId) -> Option<&[VStroke]> {
+        self.layer(layer)?.vector.as_deref()
+    }
+
+    /// 線を 1 本足して、そのダブ列を焼く。`hardness` と `opacity` はブラシのもの。
+    /// 選択範囲は見ない(線は丸ごと持つので、画素だけ絞ると描き直しで戻ってしまう)。
+    pub fn vector_add_stroke(
+        &mut self,
+        layer: LayerId,
+        stroke: VStroke,
+        dabs: &[f32],
+        hardness: f32,
+        opacity: f32,
+    ) -> Vec<TileKey> {
+        let bounds = self.bounds();
+        let Some(l) = self.layer_mut(layer) else { return Vec::new() };
+        let Some(v) = l.vector.as_mut() else { return Vec::new() };
+        let at = v.len();
+        v.push(stroke);
+        let rect = DabBuf::dabs_bounds(dabs).intersect(&bounds);
+        let snap = if rect.is_empty() {
+            Vec::new()
+        } else {
+            let mut buf = DabBuf::new(rect);
+            buf.stamp(dabs, hardness);
+            l.cel.composite_masked(rect, &buf.data, opacity, Blend::Normal, None)
+        };
+        let keys: Vec<_> = snap.iter().map(|(k, _)| *k).collect();
+        self.history.push(Entry {
+            label: "線".into(),
+            layer,
+            tiles: snap,
+            vector: Some(Splice { at, len: 1, old: Vec::new() }),
+        });
+        keys
+    }
+
+    /// `rect` の画素を消して、そこに掛かる線を順に描き直す。`dabs_of` は線からダブ列と
+    /// (硬さ, 不透明度)を作る(ブラシエンジンは呼び出し側)。戻り値はタイルの差分。
+    fn vector_redraw<F>(&mut self, layer: LayerId, rect: Rect, dabs_of: &mut F) -> Snapshot
+    where
+        F: FnMut(&VStroke) -> (Vec<f32>, f32, f32),
+    {
+        let rect = rect.intersect(&self.bounds());
+        let Some(l) = self.layer_mut(layer) else { return Vec::new() };
+        let Some(v) = l.vector.as_ref() else { return Vec::new() };
+        if rect.is_empty() {
+            return Vec::new();
+        }
+        let bpp = l.cel.format().bytes_per_pixel();
+        let zero = vec![0u8; rect.w as usize * rect.h as usize * bpp];
+        let mut snap = l.cel.write_rect(rect, &zero);
+        let strokes: Vec<&VStroke> = v.iter().filter(|s| !s.paint_bounds().intersect(&rect).is_empty()).collect();
+        let mut extra = Vec::new();
+        for s in strokes {
+            let (dabs, hardness, opacity) = dabs_of(s);
+            if dabs.is_empty() {
+                continue;
+            }
+            let mut buf = DabBuf::new(rect);
+            buf.stamp(&dabs, hardness);
+            extra.push(l.cel.composite_masked(rect, &buf.data, opacity, Blend::Normal, None));
+        }
+        for more in extra {
+            merge_snapshot(&mut snap, more);
+        }
+        snap
+    }
+
+    /// ベクター消しゴム。何も触れなければ None。
+    pub fn vector_erase<F>(
+        &mut self,
+        layer: LayerId,
+        path: &[f32],
+        radius: f32,
+        mode: EraseMode,
+        mut dabs_of: F,
+    ) -> Option<Vec<TileKey>>
+    where
+        F: FnMut(&VStroke) -> (Vec<f32>, f32, f32),
+    {
+        let strokes = self.layer(layer)?.vector.as_ref()?;
+        let r = crate::vector::erase(strokes, path, radius, mode)?;
+        let v = self.layer_mut(layer)?.vector.as_mut()?;
+        let old: Vec<VStroke> = v.splice(r.range.clone(), r.replaced.iter().cloned()).collect();
+        let snap = self.vector_redraw(layer, r.dirty, &mut dabs_of);
+        let keys: Vec<_> = snap.iter().map(|(k, _)| *k).collect();
+        self.history.push(Entry {
+            label: "ベクター消去".into(),
+            layer,
+            tiles: snap,
+            vector: Some(Splice {
+                at: r.range.start,
+                len: r.replaced.len(),
+                old,
+            }),
+        });
+        Some(keys)
+    }
+
+    /// 線を書き換えて(`edit`)、全部描き直す。線幅の後編集などに使う。
+    pub fn vector_edit_all<E, F>(&mut self, layer: LayerId, label: &str, edit: E, mut dabs_of: F) -> Vec<TileKey>
+    where
+        E: Fn(&mut VStroke),
+        F: FnMut(&VStroke) -> (Vec<f32>, f32, f32),
+    {
+        let Some(l) = self.layer_mut(layer) else { return Vec::new() };
+        let Some(v) = l.vector.as_mut() else { return Vec::new() };
+        if v.is_empty() {
+            return Vec::new();
+        }
+        let old = v.clone();
+        let mut dirty = old[0].paint_bounds();
+        for s in v.iter_mut() {
+            dirty = dirty.union(&s.paint_bounds());
+            edit(s);
+            dirty = dirty.union(&s.paint_bounds());
+        }
+        let n = v.len();
+        let snap = self.vector_redraw(layer, dirty, &mut dabs_of);
+        let keys: Vec<_> = snap.iter().map(|(k, _)| *k).collect();
+        self.history.push(Entry {
+            label: label.to_string(),
+            layer,
+            tiles: snap,
+            vector: Some(Splice { at: 0, len: n, old }),
         });
         keys
     }
@@ -679,7 +860,30 @@ impl Document {
     pub fn clear_layer(&mut self, layer: LayerId) -> Vec<TileKey> {
         let Some(l) = self.layer_mut(layer) else { return Vec::new() };
         let snap = l.cel.clear();
-        self.record(layer, "消去", snap)
+        // ベクターなら線も消す(履歴で一緒に戻る)
+        let vector = l.vector.as_mut().map(|v| Splice {
+            at: 0,
+            len: 0,
+            old: std::mem::take(v),
+        });
+        let keys: Vec<_> = snap.iter().map(|(k, _)| *k).collect();
+        self.history.push(Entry {
+            label: "消去".into(),
+            layer,
+            tiles: snap,
+            vector,
+        });
+        keys
+    }
+
+    /// ベクターレイヤーをラスターにする(線を捨てて画素だけ残す)。履歴は捨てる。
+    pub fn rasterize_layer(&mut self, layer: LayerId) -> bool {
+        let Some(l) = self.layer_mut(layer) else { return false };
+        if l.vector.take().is_none() {
+            return false;
+        }
+        self.history.clear();
+        true
     }
 
     pub fn write_rect(&mut self, layer: LayerId, rect: Rect, src: &[u8]) -> Vec<TileKey> {
@@ -695,6 +899,13 @@ impl Document {
                 let cur = l.cel.restore(*key, other.take());
                 *other = cur;
                 changed.push((e.layer, *key));
+            }
+            if let (Some(sp), Some(v)) = (e.vector.take(), l.vector.as_mut()) {
+                let end = (sp.at + sp.len).min(v.len());
+                let at = sp.at.min(end);
+                let n = sp.old.len();
+                let removed: Vec<VStroke> = v.splice(at..end, sp.old).collect();
+                e.vector = Some(Splice { at, len: n, old: removed });
             }
         }
         (e, changed)
@@ -1145,5 +1356,80 @@ mod tests {
         assert_eq!(doc.memory_bytes(), 0);
         doc.undo();
         assert_eq!(doc.layer(a).unwrap().cel.tile_count(), 1);
+    }
+
+    /// 線 1 本ぶんのダブ列(等間隔の円)。ブラシエンジンの代わり。
+    fn dabs_of_line(s: &VStroke) -> (Vec<f32>, f32, f32) {
+        let r = s.size();
+        let mut out = Vec::new();
+        for i in 0..s.len().saturating_sub(1) {
+            let (ax, ay) = s.point(i);
+            let (bx, by) = s.point(i + 1);
+            let n = (((bx - ax).hypot(by - ay)) / (r * 0.3)).ceil().max(1.0) as usize;
+            for k in 0..n {
+                let t = k as f32 / n as f32;
+                out.extend_from_slice(&[ax + (bx - ax) * t, ay + (by - ay) * t, r, 1.0, 0.0, 1.0, 0.0, 0.0]);
+            }
+        }
+        (out, 1.0, 1.0)
+    }
+
+    fn vline(x0: f32, y0: f32, x1: f32, y1: f32) -> VStroke {
+        let mut points = Vec::new();
+        for i in 0..11 {
+            let t = i as f32 / 10.0;
+            points.extend_from_slice(&[x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, 1.0, i as f32 * 8.0, 0.0, 0.0]);
+        }
+        VStroke { brush: r#"{"size":3}"#.into(), color: [0, 0, 0], points }
+    }
+
+    #[test]
+    fn vector_layer_add_erase_undo_roundtrip() {
+        let mut doc = Document::new(300, 300, 8 << 20);
+        let v = doc.add_vector_layer(PixelFormat::Rgba8, "線画");
+        assert!(doc.layer(v).unwrap().is_vector());
+        let s = vline(20.0, 150.0, 280.0, 150.0);
+        let (dabs, h, o) = dabs_of_line(&s);
+        let keys = doc.vector_add_stroke(v, s, &dabs, h, o);
+        assert!(!keys.is_empty());
+        let px = |d: &Document, x: i32, y: i32| d.layer(v).unwrap().cel.read_rect(Rect::new(x, y, 1, 1))[3];
+        assert_eq!(px(&doc, 150, 150), 255);
+        assert_eq!(doc.vector_strokes(v).unwrap().len(), 1);
+        // 真ん中を消す → 画素が消え、線が 2 本になる
+        let path = [150.0, 140.0, 1.0, 0.0, 0.0, 0.0, 150.0, 160.0, 1.0, 8.0, 0.0, 0.0];
+        let keys = doc.vector_erase(v, &path, 4.0, EraseMode::Normal, dabs_of_line).unwrap();
+        assert!(!keys.is_empty());
+        assert_eq!(px(&doc, 150, 150), 0, "消えた所");
+        assert_eq!(px(&doc, 40, 150), 255, "残った所は描き直されている");
+        assert_eq!(doc.vector_strokes(v).unwrap().len(), 2);
+        // Undo で線も画素も戻る
+        doc.undo();
+        assert_eq!(px(&doc, 150, 150), 255);
+        assert_eq!(doc.vector_strokes(v).unwrap().len(), 1);
+        doc.redo();
+        assert_eq!(doc.vector_strokes(v).unwrap().len(), 2);
+        assert_eq!(px(&doc, 150, 150), 0);
+        doc.undo();
+        doc.undo();
+        assert_eq!(doc.vector_strokes(v).unwrap().len(), 0);
+        assert_eq!(doc.layer(v).unwrap().cel.tile_count(), 0);
+        doc.redo();
+        // 線幅を倍に → 太くなる
+        doc.vector_edit_all(v, "太く", |s| { let z = s.size(); s.set_brush_number("size", z * 2.0); }, dabs_of_line);
+        assert!((doc.vector_strokes(v).unwrap()[0].size() - 6.0).abs() < 1e-5);
+        assert_eq!(px(&doc, 150, 153), 255);
+        doc.undo();
+        assert_eq!(px(&doc, 150, 153), 0);
+        // 保存と読み込み
+        let bytes = crate::io::imst::save(&doc);
+        let back = crate::io::imst::load(&bytes, 1 << 20).unwrap();
+        assert_eq!(back.vector_strokes(v).unwrap(), doc.vector_strokes(v).unwrap());
+        assert_eq!(px(&back, 150, 150), 255);
+        // 触れた線を消す / 複製はベクターを引き継ぐ
+        let d = doc.duplicate_layer(v).unwrap();
+        assert!(doc.layer(d).unwrap().is_vector());
+        assert!(doc.vector_erase(d, &path, 4.0, EraseMode::Touch, dabs_of_line).is_some());
+        assert_eq!(doc.vector_strokes(d).unwrap().len(), 0);
+        assert_eq!(doc.layer(d).unwrap().cel.tile_count(), 0);
     }
 }

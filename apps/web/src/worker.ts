@@ -8,6 +8,7 @@ import { extrapolateDabs } from "./input";
 import type { DabLook } from "./gl";
 import {
   DAB_STRIDE,
+  POINT_STRIDE,
   type BrushPreset,
   type FromWorker,
   type LayerInfo,
@@ -36,6 +37,20 @@ let lastBakeMs = 0;
 let bbox: { x0: number; y0: number; x1: number; y1: number } | null = null;
 // 変形中の行列(持ち上げていなければ null)
 let floatM: number[] | null = null;
+// このストロークの入力点(ベクターレイヤーでは線として保存し、CPU で焼く)
+let strokePts: number[] = [];
+let vectorErase = 0;
+
+function activeIsVector(): boolean {
+  return doc ? doc.layer_vector(active) : false;
+}
+
+/** 画素だけを変える操作はベクターレイヤーでは線とずれるので断る。 */
+function refuseOnVector(what: string): boolean {
+  if (!activeIsVector()) return false;
+  post({ type: "toast", message: `${what}はベクターレイヤーでは使えません(レイヤーパネルの「ラスタライズ」で画素にすると使えます)` });
+  return true;
+}
 
 function post(m: FromWorker, transfer: Transferable[] = []): void {
   (self as unknown as Worker).postMessage(m, transfer);
@@ -81,6 +96,7 @@ function layerInfos(): LayerInfo[] {
     opacity: doc!.layer_opacity(id),
     blend: doc!.layer_blend(id),
     clip: doc!.layer_clip(id),
+    vector: doc!.layer_vector(id),
   }));
 }
 
@@ -237,6 +253,23 @@ function bake(): void {
   lastBakeMs = performance.now() - t0;
 }
 
+/** ベクターレイヤーのストローク終了: 入力点を線として足す(か、ベクター消しゴムを掛ける)。
+ *  GPU のストロークバッファは見ず、CPU で同じ式で焼く(描き直しと同じ絵になるように)。 */
+function bakeVector(): void {
+  if (!doc || !brush || strokePts.length < POINT_STRIDE) return;
+  const t0 = performance.now();
+  const pts = Float32Array.from(strokePts);
+  let changed: Int32Array;
+  if (brush.eraser) {
+    changed = doc.vector_erase(active, pts, Math.max(0.5, brush.size), vectorErase);
+  } else {
+    const [r, g, b] = rgb255();
+    changed = doc.vector_add_stroke(active, brushJson, r, g, b, pts);
+  }
+  uploadActiveTiles(changed);
+  lastBakeMs = performance.now() - t0;
+}
+
 /** Undo / Redo の結果 [layer, tx, ty, ...] を GPU に反映する。 */
 function applyChanged(changed: Int32Array): void {
   if (!renderer || !doc) return;
@@ -324,6 +357,7 @@ async function handle(m: ToWorker): Promise<void> {
     case "brush":
       brushJson = m.brush.json;
       colorRgb = m.brush.color;
+      vectorErase = m.brush.vectorErase | 0;
       applyBrush();
       return;
     case "begin": {
@@ -335,6 +369,7 @@ async function handle(m: ToWorker): Promise<void> {
       stroke = new Stroke(brush, colorRgb[0], colorRgb[1], colorRgb[2]);
       lastDab = null;
       bbox = null;
+      strokePts = [];
       renderer.beginStroke();
       return;
     }
@@ -343,6 +378,7 @@ async function handle(m: ToWorker): Promise<void> {
       const t0 = performance.now();
       renderer.drawCalls = 0;
       const lk = look();
+      for (let i = 0; i < m.data.length; i++) strokePts.push(m.data[i]!);
       const dabs = stroke.add_points(m.data, doc, active);
       if (dabs.length) {
         renderer.drawDabs(dabs, lk);
@@ -373,7 +409,9 @@ async function handle(m: ToWorker): Promise<void> {
       stroke.free();
       stroke = null;
       lastDab = null;
-      bake();
+      if (activeIsVector()) bakeVector();
+      else bake();
+      strokePts = [];
       bbox = null;
       renderer.endStroke();
       present();
@@ -403,7 +441,7 @@ async function handle(m: ToWorker): Promise<void> {
     }
     case "addLayer": {
       if (!doc) return;
-      active = doc.add_layer(m.a8, m.name);
+      active = m.vector ? doc.add_vector_layer(m.a8, m.name) : doc.add_layer(m.a8, m.name);
       uploadActiveAll();
       rebuildMerged();
       present();
@@ -472,6 +510,9 @@ async function handle(m: ToWorker): Promise<void> {
         case "moveDown":
           ok = idx > 0 && doc.move_layer(m.id, idx - 1);
           break;
+        case "rasterize":
+          ok = doc.rasterize_layer(m.id);
+          break;
       }
       if (ok) {
         uploadActiveAll();
@@ -525,7 +566,7 @@ async function handle(m: ToWorker): Promise<void> {
       return;
     }
     case "fill": {
-      if (!doc) return;
+      if (!doc || refuseOnVector("塗りつぶし")) return;
       const t0 = performance.now();
       const [r, g, b] = rgb255();
       const changed = doc.fill(active, m.merged ? 0 : active, Math.round(m.x), Math.round(m.y), r, g, b, m.tolerance, m.contiguous);
@@ -537,7 +578,7 @@ async function handle(m: ToWorker): Promise<void> {
       return;
     }
     case "fillSelection": {
-      if (!doc) return;
+      if (!doc || refuseOnVector("塗り")) return;
       const [r, g, b] = rgb255();
       uploadActiveTiles(doc.fill_selection(active, r, g, b));
       present();
@@ -546,7 +587,7 @@ async function handle(m: ToWorker): Promise<void> {
       return;
     }
     case "deleteSelection": {
-      if (!doc) return;
+      if (!doc || refuseOnVector("消去")) return;
       uploadActiveTiles(doc.delete_selection(active));
       present();
       scheduleAutosave();
@@ -555,6 +596,10 @@ async function handle(m: ToWorker): Promise<void> {
     }
     case "transformBegin": {
       if (!doc || !renderer) return;
+      if (refuseOnVector("変形")) {
+        post({ type: "floating", rect: null, failed: true });
+        return;
+      }
       if (doc.has_floating()) return;
       const r = doc.begin_transform(active);
       if (r.length < 4) {
@@ -677,7 +722,13 @@ async function handle(m: ToWorker): Promise<void> {
         }
       }
       if (m.commit) {
-        bake();
+        if (activeIsVector()) {
+          strokePts = Array.from(pts);
+          bakeVector();
+          strokePts = [];
+        } else {
+          bake();
+        }
         bbox = null;
         renderer.endStroke();
         present();
@@ -687,6 +738,18 @@ async function handle(m: ToWorker): Promise<void> {
         renderer.drawPredicted(new Float32Array(0), look());
         present(true, false);
       }
+      return;
+    }
+    case "vectorWidth":
+    case "vectorUniform": {
+      if (!doc || !activeIsVector()) return;
+      const t0 = performance.now();
+      const changed = m.type === "vectorWidth" ? doc.vector_scale_width(active, m.factor) : doc.vector_uniform_width(active);
+      uploadActiveTiles(changed);
+      lastBakeMs = performance.now() - t0;
+      present();
+      scheduleAutosave();
+      post({ type: "stats", stats: stats(t0, 0, 0) });
       return;
     }
     case "adjustPreview": {
@@ -699,6 +762,11 @@ async function handle(m: ToWorker): Promise<void> {
     }
     case "adjustCommit": {
       if (!doc || !renderer) return;
+      if (refuseOnVector("色調補正")) {
+        renderer.setAdjust(null);
+        present();
+        return;
+      }
       const t0 = performance.now();
       renderer.setAdjust(null);
       uploadActiveTiles(doc.adjust_layer(active, JSON.stringify(m.adjust)));
@@ -713,7 +781,7 @@ async function handle(m: ToWorker): Promise<void> {
       present();
       return;
     case "filter": {
-      if (!doc) return;
+      if (!doc || refuseOnVector("フィルタ")) return;
       const t0 = performance.now();
       const changed = m.kind === "blur" ? doc.blur_layer(active, m.radius) : doc.sharpen_layer(active, m.radius, m.amount);
       uploadActiveTiles(changed);
