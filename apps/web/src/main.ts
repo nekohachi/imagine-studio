@@ -16,7 +16,9 @@ import {
   renderColorPanel,
   renderFillPanel,
   renderLayersPanel,
+  renderRulerPanel,
   renderSelectPanel,
+  rulerTap,
   renderTransformPanel,
   setThumbnails,
   viewMenu,
@@ -192,6 +194,13 @@ const ctx: Ctx = {
       state.emit("tool");
     },
     transformDelta: (delta) => input.applyToTransform(delta),
+    setRuler: (r) => {
+      state.settings.ruler = r;
+      state.save();
+      bridge.send({ type: "ruler", ruler: state.effectiveRuler() });
+      input.refreshOverlay();
+      if (shell.panelOpen() === "ruler") shell.rerender();
+    },
     adjustPreview: () => {
       if (!state.adjust) return;
       bridge.send({ type: "adjustPreview", adjust: { ...state.adjust } });
@@ -269,11 +278,12 @@ const input = new CanvasInput(canvas, state, bridge, mods, {
       shell.toast(rgbToHex(m.rgb));
     });
   },
+  onRulerTap: (x, y) => rulerTap(ctx, x, y),
   closePanels: () => {
     if (!shell.panelOpen()) return false;
     // 選択と塗りのパネルは開いたまま使う(タップが操作なので)
     const open = shell.panelOpen();
-    if (open === "select" || open === "fill" || open === "transform" || open === "adjust") return false;
+    if (open === "select" || open === "fill" || open === "transform" || open === "adjust" || open === "ruler") return false;
     shell.closePanel();
     return true;
   },
@@ -299,6 +309,7 @@ const panels: Record<string, () => void> = {
   select: () => shell.openPanel("select", (b) => renderSelectPanel(b, ctx)),
   transform: () => shell.openPanel("transform", (b) => renderTransformPanel(b, ctx)),
   fill: () => shell.openPanel("fill", (b) => renderFillPanel(b, ctx)),
+  ruler: () => shell.openPanel("ruler", (b) => renderRulerPanel(b, ctx)),
   brush: () => {
     ctx.act.setTool("brush");
     shell.openPanel("brush", (b) => renderBrushPanel(b, ctx));
@@ -437,6 +448,7 @@ bridge.on("ready", (m) => {
   input.fit();
   applyLayers(m.layers, m.active);
   if (m.restored) shell.toast("前回の続きから");
+  bridge.send({ type: "ruler", ruler: state.effectiveRuler() });
   renderHud();
 });
 bridge.on("doc", (m) => {
@@ -517,6 +529,8 @@ window.addEventListener("keydown", (e) => {
     panels.fill!();
   } else if (k === "t") {
     panels.transform!();
+  } else if (k === "r") {
+    panels.ruler!();
   } else if ((e.ctrlKey || e.metaKey) && k === "u") {
     e.preventDefault();
     panels.adjust!();

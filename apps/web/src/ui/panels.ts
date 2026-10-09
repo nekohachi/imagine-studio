@@ -3,6 +3,7 @@ import { attachRadialButton, openRadial, type RadialItem, type RadialMenu } from
 import type { Bridge } from "../bridge";
 import { ADJUST_IDENTITY, isAdjustIdentity, type AdjustParams, type BrushJson, type BrushPreset, type LayerInfo } from "../protocol";
 import type { AppState } from "../state";
+import { NO_RULER, RULER_LABELS, type Ruler } from "../ruler";
 import { ColorPicker, DEFAULT_PALETTE, hexToRgb, rgbToHex, type Rgb } from "./color";
 import { ICONS, svgIcon } from "./icons";
 import { el, type Shell } from "./shell";
@@ -27,7 +28,9 @@ export interface Ctx {
     exportPng: () => void;
     eyedropOnce: () => void;
     thumbnails: () => void;
-    setTool: (tool: "brush" | "select" | "fill" | "transform") => void;
+    setTool: (tool: "brush" | "select" | "fill" | "transform" | "ruler") => void;
+    /** 定規を置き換えて、ワーカーと表示に反映する */
+    setRuler: (r: Ruler) => void;
     /** 変形: 持ち上げる / 置く / 戻す / 反転や回転 */
     transformBegin: () => void;
     transformCommit: () => void;
@@ -175,6 +178,142 @@ export function renderTransformPanel(body: HTMLElement, ctx: Ctx): void {
       act.setTool("brush");
       ctx.shell.closePanel();
     }, "brush"));
+  }
+}
+
+// ---- 定規 ----
+
+export function renderRulerPanel(body: HTMLElement, ctx: Ctx): void {
+  const { state, act } = ctx;
+  act.setTool("ruler");
+  const r = state.settings.ruler;
+  body.append(el.title("定規"));
+  const kinds = el.row();
+  for (const k of ["none", "line", "parallel", "radial", "concentric", "perspective", "symmetry"] as const) {
+    kinds.append(
+      el.button(RULER_LABELS[k], () => {
+        state.rulerTap = 0;
+        act.setRuler(defaultRuler(k, state));
+        ctx.shell.rerender();
+      }, undefined, r.kind === k ? "on" : "")
+    );
+  }
+  body.append(kinds);
+  const help = document.createElement("div");
+  help.className = "phelp";
+  help.textContent = {
+    none: "定規は効いていません。種類を選んでください。",
+    line: "キャンバスを 2 回タップして、線が通る 2 点を置きます。描く線はその直線に吸着します。",
+    parallel: "下の角度か、キャンバスを 2 回タップした向きに平行な線を描きます。",
+    radial: "キャンバスをタップして中心を置きます。線は中心から放射状になります。",
+    concentric: "キャンバスをタップして中心を置きます。線は中心のまわりの円になります。",
+    perspective: "キャンバスをタップして消失点を置きます(消失点の数だけ順に)。描き始めの向きで、どの消失点へ向かうか決まります。2 点以下なら垂直も、1 点なら水平も引けます。",
+    symmetry: "キャンバスをタップして中心を置きます。線は中心のまわりに写しが描かれます。",
+  }[r.kind];
+  body.append(help);
+  if (r.kind === "parallel") {
+    body.append(
+      el.slider("角度", 0, 179, 1, Math.round((r.angle * 180) / Math.PI) % 180, (v) => act.setRuler({ ...r, angle: (v * Math.PI) / 180 }))
+    );
+  }
+  if (r.kind === "perspective") {
+    const row = el.row();
+    for (const n of [1, 2, 3]) {
+      row.append(
+        el.button(`${n} 点`, () => {
+          const vps = r.vps.slice(0, n);
+          while (vps.length < n) vps.push([state.docW * (0.2 + 0.3 * vps.length), state.docH * 0.4]);
+          state.rulerTap = 0;
+          act.setRuler({ ...r, vps });
+          ctx.shell.rerender();
+        }, undefined, r.vps.length === n ? "on" : "")
+      );
+    }
+    body.append(row);
+  }
+  if (r.kind === "symmetry") {
+    body.append(
+      el.slider("分割数", 1, 8, 1, r.copies, (v) => act.setRuler({ ...r, copies: v })),
+      el.toggle("鏡像(軸で左右を写す)", r.mirror, (v) => act.setRuler({ ...r, mirror: v })),
+      el.slider("軸の角度", 0, 179, 1, Math.round((r.angle * 180) / Math.PI) % 180, (v) => act.setRuler({ ...r, angle: (v * Math.PI) / 180 }))
+    );
+  }
+  body.append(el.title("使う"));
+  body.append(
+    el.toggle("定規を効かせる(オフでも位置は残る)", state.settings.rulerOn, (v) => {
+      state.settings.rulerOn = v;
+      state.save();
+      act.setRuler(state.settings.ruler);
+    })
+  );
+  body.append(el.title("ツールを戻す"));
+  body.append(el.button("ブラシへ(定規は効いたまま)", () => {
+    act.setTool("brush");
+    ctx.shell.closePanel();
+  }, "brush"));
+}
+
+/** 種類を変えたときの初期位置(画面の中ほど)。 */
+function defaultRuler(kind: Ruler["kind"], state: AppState): Ruler {
+  const cx = state.docW / 2;
+  const cy = state.docH / 2;
+  switch (kind) {
+    case "none":
+      return NO_RULER;
+    case "line":
+      return { kind, ax: cx - state.docW / 4, ay: cy, bx: cx + state.docW / 4, by: cy };
+    case "parallel":
+      return { kind, angle: 0 };
+    case "radial":
+      return { kind, cx, cy };
+    case "concentric":
+      return { kind, cx, cy };
+    case "perspective":
+      return { kind, vps: [[state.docW * 0.9, cy]] };
+    case "symmetry":
+      return { kind, cx, cy, angle: Math.PI / 2, copies: 1, mirror: true };
+  }
+}
+
+/** 定規ツールでキャンバスをタップした: 点を置く。 */
+export function rulerTap(ctx: Ctx, x: number, y: number): void {
+  const { state, act } = ctx;
+  const r = state.settings.ruler;
+  const i = state.rulerTap;
+  switch (r.kind) {
+    case "line":
+      act.setRuler(i % 2 === 0 ? { ...r, ax: x, ay: y } : { ...r, bx: x, by: y });
+      state.rulerTap = i + 1;
+      ctx.shell.toast(i % 2 === 0 ? "2 点目をタップ" : "直線を置きました");
+      break;
+    case "parallel": {
+      if (i % 2 === 0) {
+        state.rulerTap = i + 1;
+        state.rulerA = [x, y];
+        ctx.shell.toast("向きの 2 点目をタップ");
+      } else {
+        const a = state.rulerA ?? [x - 100, y];
+        act.setRuler({ ...r, angle: Math.atan2(y - a[1], x - a[0]) });
+        state.rulerTap = i + 1;
+        ctx.shell.rerender();
+      }
+      break;
+    }
+    case "radial":
+    case "concentric":
+    case "symmetry":
+      act.setRuler({ ...r, cx: x, cy: y });
+      break;
+    case "perspective": {
+      const vps = r.vps.map((v) => [v[0], v[1]] as [number, number]);
+      vps[i % vps.length] = [x, y];
+      act.setRuler({ ...r, vps });
+      state.rulerTap = i + 1;
+      ctx.shell.toast(`消失点 ${(i % vps.length) + 1} を置きました`);
+      break;
+    }
+    default:
+      ctx.shell.toast("定規の種類を先に選んでください");
   }
 }
 
@@ -374,7 +513,6 @@ function brushRowMenu(ctx: Ctx, p: BrushPreset): RadialMenu {
 /** キャンバス長押しの輪(docs/04: ブラシ / 消しゴム / 選択 / 変形 / 塗り / 図形 / スポイト / レイヤー)。 */
 export function canvasMenu(ctx: Ctx): RadialMenu {
   const { act, shell } = ctx;
-  const later = (label: string) => ({ label, sub: "フェーズ 4", icon: ICONS.grid, run: () => shell.toast(`${label}はフェーズ 4 で入ります`) });
   return {
     N: {
       label: "ブラシ",
@@ -404,7 +542,12 @@ export function canvasMenu(ctx: Ctx): RadialMenu {
       icon: ICONS.grid,
       run: () => shell.openPanel("fill", (b) => renderFillPanel(b, ctx)),
     },
-    SW: later("図形"),
+    SW: {
+      label: "定規",
+      sub: ctx.state.settings.rulerOn && ctx.state.settings.ruler.kind !== "none" ? RULER_LABELS[ctx.state.settings.ruler.kind] : undefined,
+      icon: ICONS.transform,
+      run: () => shell.openPanel("ruler", (b) => renderRulerPanel(b, ctx)),
+    },
     W: { label: "スポイト", sub: "次のタップ", icon: ICONS.dropper, run: () => act.eyedropOnce() },
     NW: { label: "レイヤー", icon: ICONS.layers, run: () => shell.openPanel("layers", (b) => renderLayersPanel(b, ctx)) },
   };

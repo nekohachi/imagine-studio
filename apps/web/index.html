@@ -67,6 +67,26 @@
         stroke-width: 1.5;
         stroke-dasharray: 6 4;
       }
+      #overlay .ruler .rl {
+        fill: none;
+        stroke: #e26ac0;
+        stroke-width: 1;
+        stroke-dasharray: none;
+        opacity: 0.75;
+      }
+      #overlay .ruler .rl.faint {
+        opacity: 0.28;
+      }
+      #overlay .ruler .rm {
+        fill: #fff;
+        stroke: #e26ac0;
+        stroke-width: 2;
+        stroke-dasharray: none;
+      }
+      #overlay .ruler .rt {
+        fill: #e26ac0;
+        font: 12px sans-serif;
+      }
       #overlay .tbox {
         fill: none;
         stroke: #4f9fd1;
@@ -283,6 +303,11 @@
       }
       .pbtn.icon-only {
         padding: 0 8px;
+      }
+      .pbtn.on {
+        border-color: var(--accent);
+        background: rgba(79, 159, 209, 0.18);
+        color: #fff;
       }
       .pbtn:active {
         background: rgba(255, 255, 255, 0.16);

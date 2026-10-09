@@ -31,6 +31,8 @@ export interface CanvasInputHooks {
   onViewRing: (x: number, y: number) => RadialMenu;
   onTap: (fingers: number, double: boolean) => void;
   onEyedrop: (docX: number, docY: number) => void;
+  /** 定規ツールのタップ(doc) */
+  onRulerTap: (docX: number, docY: number) => void;
   /** 描き始めにパネルを閉じる。閉じたなら真(そのタップは描かない) */
   closePanels: () => boolean;
   /** 選択の矩形や投げ縄を仮表示する SVG(画面座標、CSS px) */
@@ -211,8 +213,9 @@ export class CanvasInput {
     if (this.selecting) return;
     const corners = this.transformCorners();
     const ov = this.hooks.overlay;
+    const ruler = this.rulerSvg();
     if (!corners) {
-      ov.innerHTML = "";
+      ov.innerHTML = ruler;
       return;
     }
     const css = corners.map(([x, y]) => this.toCss(x, y));
@@ -221,7 +224,90 @@ export class CanvasInput {
     const handles = css
       .map(([x, y]) => `<rect class="handle" x="${x - hs / 2}" y="${y - hs / 2}" width="${hs}" height="${hs}"/>`)
       .join("");
-    ov.innerHTML = `<path class="tbox" d="${d}"/>${handles}`;
+    ov.innerHTML = `${ruler}<path class="tbox" d="${d}"/>${handles}`;
+  }
+
+  /** 定規の表示(画面座標、CSS px)。 */
+  private rulerSvg(): string {
+    const r = this.state.settings.ruler;
+    if (!this.state.settings.rulerOn || r.kind === "none") return "";
+    const W = this.canvas.clientWidth;
+    const H = this.canvas.clientHeight;
+    const L = Math.hypot(W, H) * 1.5;
+    const parts: string[] = [];
+    // doc の方向ベクトルを画面の方向に(回転だけ)
+    const dir = (dx: number, dy: number): [number, number] => {
+      const [ox, oy] = this.toCss(0, 0);
+      const [px, py] = this.toCss(dx, dy);
+      const l = Math.hypot(px - ox, py - oy) || 1;
+      return [(px - ox) / l, (py - oy) / l];
+    };
+    const lineThrough = (x: number, y: number, dx: number, dy: number, cls = "") =>
+      `<line class="rl ${cls}" x1="${x - dx * L}" y1="${y - dy * L}" x2="${x + dx * L}" y2="${y + dy * L}"/>`;
+    const mark = (x: number, y: number) => `<circle class="rm" cx="${x}" cy="${y}" r="6"/>`;
+    switch (r.kind) {
+      case "line": {
+        const [ax, ay] = this.toCss(r.ax, r.ay);
+        const [bx, by] = this.toCss(r.bx, r.by);
+        const [dx, dy] = dir(r.bx - r.ax, r.by - r.ay);
+        parts.push(lineThrough(ax, ay, dx, dy), mark(ax, ay), mark(bx, by));
+        break;
+      }
+      case "parallel": {
+        const [dx, dy] = dir(Math.cos(r.angle), Math.sin(r.angle));
+        const [nx, ny] = [-dy, dx];
+        for (let k = -12; k <= 12; k++) {
+          parts.push(lineThrough(W / 2 + nx * k * 90, H / 2 + ny * k * 90, dx, dy, k === 0 ? "" : "faint"));
+        }
+        break;
+      }
+      case "radial": {
+        const [cx, cy] = this.toCss(r.cx, r.cy);
+        for (let k = 0; k < 24; k++) {
+          const a = (k * Math.PI) / 12;
+          const [dx, dy] = dir(Math.cos(a), Math.sin(a));
+          parts.push(`<line class="rl faint" x1="${cx}" y1="${cy}" x2="${cx + dx * L}" y2="${cy + dy * L}"/>`);
+        }
+        parts.push(mark(cx, cy));
+        break;
+      }
+      case "concentric": {
+        const [cx, cy] = this.toCss(r.cx, r.cy);
+        for (let k = 1; k <= 24; k++) parts.push(`<circle class="rl faint" cx="${cx}" cy="${cy}" r="${k * 70}"/>`);
+        parts.push(mark(cx, cy));
+        break;
+      }
+      case "perspective": {
+        r.vps.forEach(([vx, vy], i) => {
+          const [cx, cy] = this.toCss(vx, vy);
+          for (let k = 0; k < 36; k++) {
+            const a = (k * Math.PI) / 18;
+            const [dx, dy] = dir(Math.cos(a), Math.sin(a));
+            parts.push(`<line class="rl faint" x1="${cx}" y1="${cy}" x2="${cx + dx * L}" y2="${cy + dy * L}"/>`);
+          }
+          parts.push(mark(cx, cy), `<text class="rt" x="${cx + 9}" y="${cy - 9}">${i + 1}</text>`);
+        });
+        break;
+      }
+      case "symmetry": {
+        const [cx, cy] = this.toCss(r.cx, r.cy);
+        const n = Math.max(1, r.copies);
+        for (let k = 0; k < n; k++) {
+          if (r.mirror) {
+            const a = r.angle + (Math.PI * k) / n;
+            const [dx, dy] = dir(Math.cos(a), Math.sin(a));
+            parts.push(lineThrough(cx, cy, dx, dy));
+          } else {
+            const a = r.angle + (Math.PI * 2 * k) / n;
+            const [dx, dy] = dir(Math.cos(a), Math.sin(a));
+            parts.push(`<line class="rl" x1="${cx}" y1="${cy}" x2="${cx + dx * L}" y2="${cy + dy * L}"/>`);
+          }
+        }
+        parts.push(mark(cx, cy));
+        break;
+      }
+    }
+    return `<g class="ruler">${parts.join("")}</g>`;
   }
 
   /** つまみの上なら、その添字(0..3)。 */
@@ -281,6 +367,7 @@ export class CanvasInput {
     if (!s) return;
     this.selecting = null;
     this.drawOverlay();
+    this.refreshOverlay();
     if (cancel) return;
     const mode = this.mods.on("shift") ? 1 : this.mods.on("ctrl") ? 2 : 0;
     const p = s.pts;
@@ -378,6 +465,13 @@ export class CanvasInput {
           this.dragging = { id: e.pointerId, kind: "move", base: t.m, x0: x, y0: y, px: 0, py: 0 };
         }
         c.setPointerCapture(e.pointerId);
+        return;
+      }
+
+      // 定規: タップで点を置く
+      if (this.state.tool === "ruler") {
+        const [x, y] = this.toDoc(e);
+        this.hooks.onRulerTap(x, y);
         return;
       }
 

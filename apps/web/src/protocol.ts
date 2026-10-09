@@ -110,6 +110,7 @@ export type ToWorker =
   | { type: "cancel" }
   | { type: "setLayer"; id: number }
   | { type: "addLayer"; a8: boolean; name: string; vector?: boolean }
+  | { type: "ruler"; ruler: import("./ruler").Ruler }
   | { type: "vectorWidth"; factor: number }
   | { type: "vectorUniform" }
   | { type: "setLayerVisible"; id: number; visible: boolean }

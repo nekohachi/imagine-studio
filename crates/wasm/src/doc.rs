@@ -145,6 +145,35 @@ impl Doc {
         keys_to_array(&self.inner.vector_add_stroke(layer, stroke, &dabs, hardness, opacity))
     }
 
+    /// 線を何本かまとめて足す(対称定規)。`points` は全部の点を続けて並べ、`counts` に各線の点数。履歴は 1 項目。
+    pub fn vector_add_strokes(&mut self, layer: u32, brush_json: &str, r: u8, g: u8, b: u8, points: &[f32], counts: &[u32]) -> js_sys::Int32Array {
+        let mut items = Vec::with_capacity(counts.len());
+        let mut off = 0usize;
+        for &c in counts {
+            let n = c as usize;
+            if off + n * VPOINT > points.len() || n == 0 {
+                break;
+            }
+            let t0 = points[off + 3];
+            let mut pts = points[off..off + n * VPOINT].to_vec();
+            for p in pts.chunks_exact_mut(VPOINT) {
+                p[3] -= t0;
+            }
+            off += n * VPOINT;
+            let stroke = VStroke {
+                brush: brush_json.to_string(),
+                color: [r, g, b],
+                points: pts,
+            };
+            let (dabs, hardness, opacity) = dabs_of(&stroke);
+            items.push((stroke, dabs, hardness, opacity));
+        }
+        if items.is_empty() {
+            return js_sys::Int32Array::new_with_length(0);
+        }
+        keys_to_array(&self.inner.vector_add_strokes(layer, items))
+    }
+
     /// ベクター消しゴム。`mode` 0 通常、1 触れた線を消す、2 交点まで。何も触れなければ長さ 0。
     pub fn vector_erase(&mut self, layer: u32, path: &[f32], radius: f32, mode: u32) -> js_sys::Int32Array {
         match self.inner.vector_erase(layer, path, radius, EraseMode::from_u32(mode), dabs_of) {

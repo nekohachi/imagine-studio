@@ -4,6 +4,7 @@
 import init, { Brush, Doc, Stroke, version } from "./wasm/imagine_wasm.js";
 import wasmUrl from "./wasm/imagine_wasm_bg.wasm?url";
 import { Renderer } from "./gl";
+import type { Affine } from "./affine";
 import { extrapolateDabs } from "./input";
 import type { DabLook } from "./gl";
 import {
@@ -16,6 +17,7 @@ import {
   type ToWorker,
   type View,
 } from "./protocol";
+import { NO_RULER, Snapper, symmetryTransforms, transformPoints, type Ruler } from "./ruler";
 import { idbGet, idbPut } from "./storage";
 
 const HISTORY_MB = 64;
@@ -29,8 +31,11 @@ let brushJson = "{}";
 let colorRgb: [number, number, number] = [0.1, 0.1, 0.1];
 let view: View = { scale: 1, tx: 0, ty: 0, rot: 0 };
 let active = 0;
-let stroke: Stroke | null = null;
-let lastDab: number[] | null = null;
+// 進行中のストローク。対称定規では写しの数だけ並ぶ(0 番が本体)
+let strokes: Stroke[] = [];
+let lastDabs: Array<number[] | null> = [];
+let ruler: Ruler = NO_RULER;
+let snapper: Snapper | null = null;
 let lastStrokeDabs = 0;
 let lastBakeMs = 0;
 // このストロークで触った矩形(ドキュメント px)
@@ -38,8 +43,17 @@ let bbox: { x0: number; y0: number; x1: number; y1: number } | null = null;
 // 変形中の行列(持ち上げていなければ null)
 let floatM: number[] | null = null;
 // このストロークの入力点(ベクターレイヤーでは線として保存し、CPU で焼く)
-let strokePts: number[] = [];
+let strokePts: number[][] = [];
 let vectorErase = 0;
+
+let copies: Affine[] = [[1, 0, 0, 1, 0, 0]];
+
+function freeStrokes(): void {
+  for (const s of strokes) s.free();
+  strokes = [];
+  lastDabs = [];
+  snapper = null;
+}
 
 function activeIsVector(): boolean {
   return doc ? doc.layer_vector(active) : false;
@@ -105,7 +119,7 @@ function stats(frameStart: number, dabs: number, lastInputTime: number): Stats {
   return {
     frameMs: now - frameStart,
     dabs,
-    strokeDabs: stroke ? stroke.dab_count : lastStrokeDabs,
+    strokeDabs: strokes.length ? strokes[0]!.dab_count : lastStrokeDabs,
     inputToDrawMs: lastInputTime > 0 ? now - lastInputTime : 0,
     drawCalls: renderer ? renderer.drawCalls : 0,
     bakeMs: lastBakeMs,
@@ -256,17 +270,25 @@ function bake(): void {
 /** ベクターレイヤーのストローク終了: 入力点を線として足す(か、ベクター消しゴムを掛ける)。
  *  GPU のストロークバッファは見ず、CPU で同じ式で焼く(描き直しと同じ絵になるように)。 */
 function bakeVector(): void {
-  if (!doc || !brush || strokePts.length < POINT_STRIDE) return;
+  if (!doc || !brush) return;
+  const lists = strokePts.filter((p) => p.length >= POINT_STRIDE);
+  if (!lists.length) return;
   const t0 = performance.now();
-  const pts = Float32Array.from(strokePts);
-  let changed: Int32Array;
   if (brush.eraser) {
-    changed = doc.vector_erase(active, pts, Math.max(0.5, brush.size), vectorErase);
+    // 写しごとに消す(履歴は写しの数だけ積まれる)
+    for (const p of lists) {
+      uploadActiveTiles(doc.vector_erase(active, Float32Array.from(p), Math.max(0.5, brush.size), vectorErase));
+    }
   } else {
     const [r, g, b] = rgb255();
-    changed = doc.vector_add_stroke(active, brushJson, r, g, b, pts);
+    if (lists.length === 1) {
+      uploadActiveTiles(doc.vector_add_stroke(active, brushJson, r, g, b, Float32Array.from(lists[0]!)));
+    } else {
+      const flat = Float32Array.from(lists.flat());
+      const counts = Uint32Array.from(lists.map((p) => p.length / POINT_STRIDE));
+      uploadActiveTiles(doc.vector_add_strokes(active, brushJson, r, g, b, flat, counts));
+    }
   }
-  uploadActiveTiles(changed);
   lastBakeMs = performance.now() - t0;
 }
 
@@ -348,11 +370,11 @@ async function handle(m: ToWorker): Promise<void> {
     }
     case "resize":
       renderer?.resize(m.viewW, m.viewH);
-      present(stroke !== null, stroke !== null);
+      present(strokes.length > 0, strokes.length > 0);
       return;
     case "view":
       view = m.view;
-      present(stroke !== null, stroke !== null);
+      present(strokes.length > 0, strokes.length > 0);
       return;
     case "brush":
       brushJson = m.brush.json;
@@ -362,53 +384,74 @@ async function handle(m: ToWorker): Promise<void> {
       return;
     case "begin": {
       if (!renderer || !brush || !doc) return;
-      if (stroke) {
-        stroke.finish(doc, active);
-        stroke.free();
-      }
-      stroke = new Stroke(brush, colorRgb[0], colorRgb[1], colorRgb[2]);
-      lastDab = null;
+      freeStrokes();
+      // 定規: 吸着(1 本)と対称(写し)
+      snapper = new Snapper(ruler);
+      copies = symmetryTransforms(ruler);
+      strokes = copies.map(() => new Stroke(brush!, colorRgb[0], colorRgb[1], colorRgb[2]));
+      lastDabs = copies.map(() => null);
+      strokePts = copies.map(() => []);
       bbox = null;
-      strokePts = [];
       renderer.beginStroke();
       return;
     }
     case "points": {
-      if (!renderer || !stroke || !doc) return;
+      if (!renderer || !strokes.length || !doc) return;
       const t0 = performance.now();
       renderer.drawCalls = 0;
       const lk = look();
-      for (let i = 0; i < m.data.length; i++) strokePts.push(m.data[i]!);
-      const dabs = stroke.add_points(m.data, doc, active);
-      if (dabs.length) {
-        renderer.drawDabs(dabs, lk);
-        growBbox(dabs);
-        lastDab = Array.from(dabs.subarray(dabs.length - DAB_STRIDE));
+      const mapped = snapper ? snapper.feed(m.data) : m.data;
+      let n = 0;
+      for (let k = 0; k < strokes.length; k++) {
+        const pk = k === 0 ? mapped : transformPoints(mapped, copies[k]!);
+        for (let i = 0; i < pk.length; i++) strokePts[k]!.push(pk[i]!);
+        const dabs = strokes[k]!.add_points(pk, doc, active);
+        if (dabs.length) {
+          renderer.drawDabs(dabs, lk);
+          growBbox(dabs);
+          lastDabs[k] = Array.from(dabs.subarray(dabs.length - DAB_STRIDE));
+          n += dabs.length / DAB_STRIDE;
+        }
       }
-      if (lastDab && m.predicted.length) {
-        const pd = extrapolateDabs(lastDab, brush?.spacing ?? 0.2, m.predicted);
+      // 予測は本体だけ(写しは次のフレームで追いつく)
+      const pred = snapper && m.predicted.length ? snapper.map(m.predicted) : m.predicted;
+      if (lastDabs[0] && pred.length) {
+        const pd = extrapolateDabs(lastDabs[0]!, brush?.spacing ?? 0.2, pred);
         renderer.drawPredicted(pd, lk);
       } else {
         renderer.drawPredicted(new Float32Array(0), lk);
       }
       present(true, true);
       const lastT = m.data.length >= 4 ? m.data[m.data.length - 1]! : 0;
-      post({ type: "stats", stats: stats(t0, dabs.length / DAB_STRIDE, lastT) });
+      post({ type: "stats", stats: stats(t0, n, lastT) });
       return;
     }
     case "end": {
-      if (!renderer || !stroke || !doc) return;
+      if (!renderer || !strokes.length || !doc) return;
       const t0 = performance.now();
       renderer.drawCalls = 0;
-      const dabs = stroke.finish(doc, active);
-      if (dabs.length) {
-        renderer.drawDabs(dabs, look());
-        growBbox(dabs);
+      // 向きが決まらないまま終わった(短いタップ)なら貯めた点をそのまま流す
+      const rest = snapper ? snapper.finish() : new Float32Array(0);
+      let n = 0;
+      for (let k = 0; k < strokes.length; k++) {
+        if (rest.length) {
+          const pk = k === 0 ? rest : transformPoints(rest, copies[k]!);
+          for (let i = 0; i < pk.length; i++) strokePts[k]!.push(pk[i]!);
+          const d0 = strokes[k]!.add_points(pk, doc, active);
+          if (d0.length) {
+            renderer.drawDabs(d0, look());
+            growBbox(d0);
+          }
+        }
+        const dabs = strokes[k]!.finish(doc, active);
+        if (dabs.length) {
+          renderer.drawDabs(dabs, look());
+          growBbox(dabs);
+          n += dabs.length / DAB_STRIDE;
+        }
       }
-      lastStrokeDabs = stroke.dab_count;
-      stroke.free();
-      stroke = null;
-      lastDab = null;
+      lastStrokeDabs = strokes[0]!.dab_count;
+      freeStrokes();
       if (activeIsVector()) bakeVector();
       else bake();
       strokePts = [];
@@ -416,15 +459,12 @@ async function handle(m: ToWorker): Promise<void> {
       renderer.endStroke();
       present();
       scheduleAutosave();
-      post({ type: "stats", stats: stats(t0, dabs.length / DAB_STRIDE, 0) });
+      post({ type: "stats", stats: stats(t0, n, 0) });
       return;
     }
     case "cancel": {
       if (!renderer) return;
-      if (stroke) {
-        stroke.free();
-        stroke = null;
-      }
+      freeStrokes();
       bbox = null;
       renderer.endStroke();
       present();
@@ -704,10 +744,7 @@ async function handle(m: ToWorker): Promise<void> {
     case "line": {
       // 直線(SHF)。毎回ストロークを作り直して 2 点だけ流す。commit で焼く
       if (!renderer || !brush || !doc) return;
-      if (stroke) {
-        stroke.free();
-        stroke = null;
-      }
+      freeStrokes();
       renderer.beginStroke();
       bbox = null;
       const s = new Stroke(brush, colorRgb[0], colorRgb[1], colorRgb[2]);
@@ -723,7 +760,7 @@ async function handle(m: ToWorker): Promise<void> {
       }
       if (m.commit) {
         if (activeIsVector()) {
-          strokePts = Array.from(pts);
+          strokePts = [Array.from(pts)];
           bakeVector();
           strokePts = [];
         } else {
@@ -740,6 +777,9 @@ async function handle(m: ToWorker): Promise<void> {
       }
       return;
     }
+    case "ruler":
+      ruler = m.ruler;
+      return;
     case "vectorWidth":
     case "vectorUniform": {
       if (!doc || !activeIsVector()) return;

@@ -1,5 +1,6 @@
 // アプリの状態。UI はここを見て描き、変更は emit で知らせる。
 import type { AdjustParams, BrushJson, BrushPreset, LayerInfo, Stats, View } from "./protocol";
+import { NO_RULER, type Ruler } from "./ruler";
 import type { Rgb } from "./ui/color";
 
 export interface Settings {
@@ -12,6 +13,9 @@ export interface Settings {
   lastBrush: string;
   color: string;
   sub: string;
+  /** 定規(doc 座標)と、効かせるかどうか */
+  ruler: Ruler;
+  rulerOn: boolean;
 }
 
 const SETTINGS_KEY = "imagine.settings";
@@ -25,6 +29,8 @@ const DEFAULT_SETTINGS: Settings = {
   lastBrush: "ペン",
   color: "#1a1a1a",
   sub: "#ffffff",
+  ruler: NO_RULER,
+  rulerOn: true,
 };
 
 export function loadSettings(): Settings {
@@ -69,7 +75,11 @@ export class AppState {
   eyedropOnce = false;
   uiHidden = false;
   /** 今のツール。brush 以外はキャンバスのタップが描画にならない */
-  tool: "brush" | "select" | "fill" | "transform" = "brush";
+  tool: "brush" | "select" | "fill" | "transform" | "ruler" = "brush";
+  /** 定規ツールで次のタップが置く点の番号(直線の A/B、パースの消失点) */
+  rulerTap = 0;
+  /** 平行線定規の向きを 2 タップで決めるときの 1 点目 */
+  rulerA: [number, number] | null = null;
   /** 変形中: 持ち上げた矩形(doc)と、今の行列 [a, b, c, d, e, f] */
   transform: { rect: [number, number, number, number]; m: [number, number, number, number, number, number] } | null = null;
   selectTool: "rect" | "lasso" | "wand" = "rect";
@@ -126,6 +136,11 @@ export class AppState {
       if (!out.includes(p)) out.push(p);
     }
     return out.slice(0, 8);
+  }
+
+  /** ワーカーに渡す定規(オフなら無し)。 */
+  effectiveRuler(): Ruler {
+    return this.settings.rulerOn ? this.settings.ruler : NO_RULER;
   }
 
   activeLayer(): LayerInfo | undefined {

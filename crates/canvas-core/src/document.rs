@@ -745,6 +745,35 @@ impl Document {
         keys
     }
 
+    /// 線を何本かまとめて足す(対称定規)。履歴は 1 項目。
+    pub fn vector_add_strokes(&mut self, layer: LayerId, items: Vec<(VStroke, Vec<f32>, f32, f32)>) -> Vec<TileKey> {
+        let bounds = self.bounds();
+        let Some(l) = self.layer_mut(layer) else { return Vec::new() };
+        let Some(v) = l.vector.as_mut() else { return Vec::new() };
+        let at = v.len();
+        let n = items.len();
+        let mut snap: Snapshot = Vec::new();
+        for (stroke, dabs, hardness, opacity) in items {
+            v.push(stroke);
+            let rect = DabBuf::dabs_bounds(&dabs).intersect(&bounds);
+            if rect.is_empty() {
+                continue;
+            }
+            let mut buf = DabBuf::new(rect);
+            buf.stamp(&dabs, hardness);
+            let more = l.cel.composite_masked(rect, &buf.data, opacity, Blend::Normal, None);
+            merge_snapshot(&mut snap, more);
+        }
+        let keys: Vec<_> = snap.iter().map(|(k, _)| *k).collect();
+        self.history.push(Entry {
+            label: "線".into(),
+            layer,
+            tiles: snap,
+            vector: Some(Splice { at, len: n, old: Vec::new() }),
+        });
+        keys
+    }
+
     /// `rect` の画素を消して、そこに掛かる線を順に描き直す。`dabs_of` は線からダブ列と
     /// (硬さ, 不透明度)を作る(ブラシエンジンは呼び出し側)。戻り値はタイルの差分。
     fn vector_redraw<F>(&mut self, layer: LayerId, rect: Rect, dabs_of: &mut F) -> Snapshot
