@@ -27,6 +27,7 @@ name = "imagine-wasm"
 version = "0.1.0"
 dependencies = [
  "brush-core",
+ "canvas-core",
  "js-sys",
  "wasm-bindgen",
 ]

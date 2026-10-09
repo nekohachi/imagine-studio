@@ -151,9 +151,19 @@ impl Document {
     /// 表示レイヤーを通常合成で 1 枚にまとめる(書き出し用、プリマルチプライド RGBA8)。
     /// A8 レイヤーは黒インクとして扱う。
     pub fn flatten_rgba8(&self, rect: Rect) -> Vec<u8> {
+        self.flatten_range(0, self.layers.len(), rect)
+    }
+
+    /// 並び `from..to`(下から数えた添字)のレイヤーだけをまとめる。
+    /// 編集中レイヤーの「下」「上」をそれぞれ 1 枚にするのに使う(docs/02 の 3 枚方式)。
+    pub fn flatten_range(&self, from: usize, to: usize, rect: Rect) -> Vec<u8> {
         let n = rect.w.max(0) as usize * rect.h.max(0) as usize;
         let mut out = vec![0u8; n * 4];
-        for l in &self.layers {
+        let to = to.min(self.layers.len());
+        if from >= to {
+            return out;
+        }
+        for l in &self.layers[from..to] {
             if !l.visible || l.opacity <= 0.0 {
                 continue;
             }

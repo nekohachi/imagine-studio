@@ -1,13 +1,19 @@
 // WebGL2 レンダラ(描画ワーカーの中で動く)。
 //
 // docs/02 の方針:
-// - テクスチャは RGBA8 だけ。浮動小数は使わない。
+// - テクスチャは RGBA8 / R8 だけ。浮動小数は使わない。
 // - 合成はプリマルチプライド src-over(ONE, ONE_MINUS_SRC_ALPHA)。
-// - ストローク中は「レイヤー + ストロークバッファ(不透明度を掛けて) + 予測バッファ」の 3 枚で表示。
-// - ストローク終了時にストロークバッファをレイヤーへ 1 回だけ焼く(同一ストローク内で濃くならない)。
-// - 表示の最終段で微小なディザを足す(8bit のバンディング対策)。
+// - 毎フレーム合成するのは「下まとめ」「編集中レイヤー(+ストロークバッファ、予測)」「上まとめ」。
+//   レイヤーが何枚あっても画面の合成コストは変わらない。
+// - ストローク終了時にストロークバッファの汚れた矩形を読み戻し、CPU(wasm)で焼く。
+//   GPU の編集中レイヤーは変わったタイルだけ再転送する。
+// - 縮小表示はミップで描く。表示の最終段で微小なディザを足す。
 //
-// フェーズ 0 なのでレイヤーは 1 枚の全面テクスチャ。タイル化はフェーズ 1。
+// テクスチャの向きはドキュメントと同じ(行 0 = y 0)。画面への向きは present の行列で決める。
+
+import type { View } from "./protocol";
+
+export const TILE = 256;
 
 const DAB_VS = `#version 300 es
 precision highp float;
@@ -18,11 +24,10 @@ out vec2 vUv;
 out float vRadius;
 out float vOpacity;
 void main() {
-  // AA のために半径より 1px 広く取る
-  float r = dab.z + 1.0;
+  float r = dab.z + 1.0;                // AA のために半径より 1px 広く取る
   vec2 p = dab.xy + corner * r;
   vec2 ndc = (p / uSize) * 2.0 - 1.0;
-  gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
+  gl_Position = vec4(ndc, 0.0, 1.0);
   vUv = corner * r;
   vRadius = dab.z;
   vOpacity = dab.w;
@@ -47,11 +52,14 @@ void main() {
 
 const BLIT_VS = `#version 300 es
 precision highp float;
-layout(location=0) in vec2 corner;
+layout(location=0) in vec2 corner;     // 0..1
+uniform vec2 uDoc;                     // 描く矩形の px サイズ
+uniform mat3 uM;                       // px → NDC
 out vec2 vUv;
 void main() {
-  vUv = corner * 0.5 + 0.5;
-  gl_Position = vec4(corner, 0.0, 1.0);
+  vec3 p = uM * vec3(corner * uDoc, 1.0);
+  vUv = corner;
+  gl_Position = vec4(p.xy, 0.0, 1.0);
 }`;
 
 const BLIT_FS = `#version 300 es
@@ -60,10 +68,19 @@ in vec2 vUv;
 uniform sampler2D uTex;
 uniform float uOpacity;
 uniform float uDither;   // 0 で無効、1 で ±0.5/255
+uniform int uMode;       // 0: RGBA、1: R を黒インクのアルファとして、2: 単色(テクスチャを見ない)
+uniform vec4 uSolid;
 out vec4 o;
 float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
 void main() {
-  vec4 c = texture(uTex, vUv) * uOpacity;
+  vec4 c;
+  if (uMode == 2) {
+    c = uSolid;
+  } else {
+    vec4 t = texture(uTex, vUv);
+    c = (uMode == 1) ? vec4(0.0, 0.0, 0.0, t.r) : t;
+  }
+  c *= uOpacity;
   if (uDither > 0.0) {
     float n = (hash(gl_FragCoord.xy) - 0.5) / 255.0 * uDither;
     c.rgb += n * c.a;
@@ -74,32 +91,61 @@ void main() {
 interface Target {
   tex: WebGLTexture;
   fbo: WebGLFramebuffer;
+  w: number;
+  h: number;
+  a8: boolean;
+  mips: boolean;
+}
+
+/** 3×3 行列(列優先)。 */
+type Mat3 = Float32Array;
+
+function mat3(a: number, b: number, c: number, d: number, e: number, f: number): Mat3 {
+  // [a c e]
+  // [b d f]
+  // [0 0 1]
+  return new Float32Array([a, b, 0, c, d, 0, e, f, 1]);
+}
+
+/** FBO 用: px → NDC(行 0 が下)。 */
+function fboMatrix(w: number, h: number): Mat3 {
+  return mat3(2 / w, 0, 0, 2 / h, -1, -1);
+}
+
+/** 画面用: doc px → 画面 px(View)→ NDC(y 下向きを上向きへ)。 */
+export function presentMatrix(view: View, viewW: number, viewH: number): Mat3 {
+  const c = Math.cos(view.rot) * view.scale;
+  const s = Math.sin(view.rot) * view.scale;
+  // screen = [c -s; s c] doc + t
+  // ndc.x = 2 sx / vw - 1 ; ndc.y = 1 - 2 sy / vh
+  const ax = 2 / viewW;
+  const ay = -2 / viewH;
+  return mat3(ax * c, ay * s, ax * -s, ay * c, ax * view.tx - 1, ay * view.ty + 1);
 }
 
 export class Renderer {
   readonly gl: WebGL2RenderingContext;
-  private width = 1;
-  private height = 1;
+  private viewW = 1;
+  private viewH = 1;
+  private docW = 1;
+  private docH = 1;
   private dabProg!: WebGLProgram;
   private blitProg!: WebGLProgram;
   private quadVbo!: WebGLBuffer;
+  private unitVbo!: WebGLBuffer;
   private dabVbo!: WebGLBuffer;
   private dabVao!: WebGLVertexArrayObject;
   private blitVao!: WebGLVertexArrayObject;
-  private layer!: Target;
-  private layerPrev!: Target;
-  private stroke!: Target;
-  private predict!: Target;
-  private uDabSize!: WebGLUniformLocation;
-  private uDabColor!: WebGLUniformLocation;
-  private uDabHardness!: WebGLUniformLocation;
-  private uBlitTex!: WebGLUniformLocation;
-  private uBlitOpacity!: WebGLUniformLocation;
-  private uBlitDither!: WebGLUniformLocation;
+  private active: Target | null = null;
+  private below: Target | null = null;
+  private above: Target | null = null;
+  private stroke: Target | null = null;
+  private predict: Target | null = null;
+  private u = {} as Record<string, WebGLUniformLocation>;
+  private zeroTile = new Uint8Array(TILE * TILE * 4);
   drawCalls = 0;
-  hasPrev = false;
 
-  constructor(canvas: OffscreenCanvas, width: number, height: number) {
+  constructor(canvas: OffscreenCanvas, viewW: number, viewH: number) {
     const gl = canvas.getContext("webgl2", {
       alpha: false,
       antialias: false,
@@ -107,14 +153,13 @@ export class Renderer {
       stencil: false,
       premultipliedAlpha: true,
       preserveDrawingBuffer: false,
-      // Chrome の低遅延。Safari は無視する
-      desynchronized: true,
+      desynchronized: true, // Chrome の低遅延。Safari は無視する
       powerPreference: "high-performance",
     } as WebGLContextAttributes);
     if (!gl) throw new Error("WebGL2 が使えません");
     this.gl = gl;
     this.setup();
-    this.resize(width, height);
+    this.resize(viewW, viewH);
   }
 
   get rendererName(): string {
@@ -133,17 +178,17 @@ export class Renderer {
     const gl = this.gl;
     this.dabProg = this.program(DAB_VS, DAB_FS);
     this.blitProg = this.program(BLIT_VS, BLIT_FS);
-    this.uDabSize = gl.getUniformLocation(this.dabProg, "uSize")!;
-    this.uDabColor = gl.getUniformLocation(this.dabProg, "uColor")!;
-    this.uDabHardness = gl.getUniformLocation(this.dabProg, "uHardness")!;
-    this.uBlitTex = gl.getUniformLocation(this.blitProg, "uTex")!;
-    this.uBlitOpacity = gl.getUniformLocation(this.blitProg, "uOpacity")!;
-    this.uBlitDither = gl.getUniformLocation(this.blitProg, "uDither")!;
+    for (const n of ["uSize", "uColor", "uHardness"]) this.u[n] = gl.getUniformLocation(this.dabProg, n)!;
+    for (const n of ["uDoc", "uM", "uTex", "uOpacity", "uDither", "uMode", "uSolid"]) {
+      this.u[n] = gl.getUniformLocation(this.blitProg, n)!;
+    }
 
     this.quadVbo = gl.createBuffer()!;
     gl.bindBuffer(gl.ARRAY_BUFFER, this.quadVbo);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
-
+    this.unitVbo = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.unitVbo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl.STATIC_DRAW);
     this.dabVbo = gl.createBuffer()!;
 
     this.dabVao = gl.createVertexArray()!;
@@ -158,7 +203,7 @@ export class Renderer {
 
     this.blitVao = gl.createVertexArray()!;
     gl.bindVertexArray(this.blitVao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadVbo);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.unitVbo);
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     gl.bindVertexArray(null);
@@ -166,7 +211,9 @@ export class Renderer {
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.SCISSOR_TEST);
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
   }
 
   private program(vs: string, fs: string): WebGLProgram {
@@ -175,27 +222,24 @@ export class Renderer {
       const s = gl.createShader(type)!;
       gl.shaderSource(s, src);
       gl.compileShader(s);
-      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-        throw new Error("シェーダ: " + gl.getShaderInfoLog(s));
-      }
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error("シェーダ: " + gl.getShaderInfoLog(s));
       return s;
     };
     const p = gl.createProgram()!;
     gl.attachShader(p, mk(gl.VERTEX_SHADER, vs));
     gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs));
     gl.linkProgram(p);
-    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
-      throw new Error("リンク: " + gl.getProgramInfoLog(p));
-    }
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error("リンク: " + gl.getProgramInfoLog(p));
     return p;
   }
 
-  private target(w: number, h: number): Target {
+  private target(w: number, h: number, a8: boolean, mips: boolean): Target {
     const gl = this.gl;
     const tex = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, w, h);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    const levels = mips ? Math.floor(Math.log2(Math.max(w, h))) + 1 : 1;
+    gl.texStorage2D(gl.TEXTURE_2D, levels, a8 ? gl.R8 : gl.RGBA8, w, h);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mips ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
@@ -205,71 +249,125 @@ export class Renderer {
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    return { tex, fbo };
+    return { tex, fbo, w, h, a8, mips };
   }
 
-  private drop(t: Target | undefined): void {
+  private drop(t: Target | null): null {
+    if (t) {
+      this.gl.deleteFramebuffer(t.fbo);
+      this.gl.deleteTexture(t.tex);
+    }
+    return null;
+  }
+
+  resize(viewW: number, viewH: number): void {
+    this.viewW = Math.max(1, Math.floor(viewW));
+    this.viewH = Math.max(1, Math.floor(viewH));
+    this.gl.canvas.width = this.viewW;
+    this.gl.canvas.height = this.viewH;
+  }
+
+  /** ドキュメントのサイズを決めて、5 枚のテクスチャを作り直す。 */
+  setDocSize(w: number, h: number, activeA8: boolean): void {
+    this.docW = Math.max(1, w | 0);
+    this.docH = Math.max(1, h | 0);
+    this.active = this.drop(this.active);
+    this.below = this.drop(this.below);
+    this.above = this.drop(this.above);
+    this.stroke = this.drop(this.stroke);
+    this.predict = this.drop(this.predict);
+    this.active = this.target(this.docW, this.docH, activeA8, true);
+    this.below = this.target(this.docW, this.docH, false, true);
+    this.above = this.target(this.docW, this.docH, false, true);
+    this.stroke = this.target(this.docW, this.docH, false, false);
+    this.predict = this.target(this.docW, this.docH, false, false);
+  }
+
+  /** 編集中レイヤーの形式が変わったときだけ作り直す。 */
+  setActiveFormat(a8: boolean): void {
+    if (this.active && this.active.a8 === a8) return;
+    this.active = this.drop(this.active);
+    this.active = this.target(this.docW, this.docH, a8, true);
+  }
+
+  private clearTarget(t: Target | null): void {
     if (!t) return;
-    this.gl.deleteFramebuffer(t.fbo);
-    this.gl.deleteTexture(t.tex);
-  }
-
-  /** サイズ変更。内容は捨てる(フェーズ 0)。 */
-  resize(width: number, height: number): void {
-    const gl = this.gl;
-    this.width = Math.max(1, Math.floor(width));
-    this.height = Math.max(1, Math.floor(height));
-    gl.canvas.width = this.width;
-    gl.canvas.height = this.height;
-    this.drop(this.layer);
-    this.drop(this.layerPrev);
-    this.drop(this.stroke);
-    this.drop(this.predict);
-    this.layer = this.target(this.width, this.height);
-    this.layerPrev = this.target(this.width, this.height);
-    this.stroke = this.target(this.width, this.height);
-    this.predict = this.target(this.width, this.height);
-    this.hasPrev = false;
-    this.present(1);
-  }
-
-  private clearTarget(t: Target): void {
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo);
-    gl.viewport(0, 0, this.width, this.height);
+    gl.viewport(0, 0, t.w, t.h);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
   }
 
-  /** ストローク開始: 直前のレイヤーを控え(1 段 Undo)、ストロークバッファを空にする。 */
+  clearActive(): void {
+    this.clearTarget(this.active);
+  }
+
+  /** 編集中レイヤーのタイル 1 枚を転送する。data の長さ 0 は「タイルが無い」= 透明で埋める。 */
+  uploadActiveTile(tx: number, ty: number, data: Uint8Array): void {
+    const t = this.active;
+    if (!t) return;
+    const gl = this.gl;
+    const x = tx * TILE;
+    const y = ty * TILE;
+    const w = Math.min(TILE, this.docW - x);
+    const h = Math.min(TILE, this.docH - y);
+    if (w <= 0 || h <= 0 || x < 0 || y < 0) return;
+    gl.bindTexture(gl.TEXTURE_2D, t.tex);
+    gl.pixelStorei(gl.UNPACK_ROW_LENGTH, TILE);
+    const src = data.length ? data : this.zeroTile;
+    if (t.a8) {
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, w, h, gl.RED, gl.UNSIGNED_BYTE, src);
+    } else {
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, src);
+    }
+    gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+  }
+
+  /** 下まとめ / 上まとめを丸ごと転送する(レイヤー切替時だけ)。 */
+  uploadMerged(which: "below" | "above", rgba: Uint8Array): void {
+    const t = which === "below" ? this.below : this.above;
+    if (!t) return;
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, t.tex);
+    gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.docW, this.docH, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+    gl.generateMipmap(gl.TEXTURE_2D);
+  }
+
+  /** 編集中レイヤーのミップを作り直す(転送をまとめた後に 1 回)。 */
+  finishActiveUpload(): void {
+    const t = this.active;
+    if (!t) return;
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, t.tex);
+    gl.generateMipmap(gl.TEXTURE_2D);
+  }
+
   beginStroke(): void {
-    this.blit(this.layer, this.layerPrev, 1, false, true);
-    this.hasPrev = true;
     this.clearTarget(this.stroke);
     this.clearTarget(this.predict);
   }
 
-  /** 確定ダブをストロークバッファへ。 */
   drawDabs(dabs: Float32Array, color: [number, number, number], hardness: number): void {
     this.drawDabsTo(this.stroke, dabs, color, hardness);
   }
 
-  /** 予測ダブを予測バッファへ(毎フレーム描き直す)。 */
   drawPredicted(dabs: Float32Array, color: [number, number, number], hardness: number): void {
     this.clearTarget(this.predict);
     if (dabs.length) this.drawDabsTo(this.predict, dabs, color, hardness);
   }
 
-  private drawDabsTo(t: Target, dabs: Float32Array, color: [number, number, number], hardness: number): void {
+  private drawDabsTo(t: Target | null, dabs: Float32Array, color: [number, number, number], hardness: number): void {
     const n = (dabs.length / 4) | 0;
-    if (n === 0) return;
+    if (!t || n === 0) return;
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo);
-    gl.viewport(0, 0, this.width, this.height);
+    gl.viewport(0, 0, t.w, t.h);
     gl.useProgram(this.dabProg);
-    gl.uniform2f(this.uDabSize, this.width, this.height);
-    gl.uniform3f(this.uDabColor, color[0], color[1], color[2]);
-    gl.uniform1f(this.uDabHardness, hardness);
+    gl.uniform2f(this.u.uSize!, t.w, t.h);
+    gl.uniform3f(this.u.uColor!, color[0], color[1], color[2]);
+    gl.uniform1f(this.u.uHardness!, hardness);
     gl.bindVertexArray(this.dabVao);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.dabVbo);
     gl.bufferData(gl.ARRAY_BUFFER, dabs, gl.STREAM_DRAW);
@@ -278,75 +376,88 @@ export class Renderer {
     this.drawCalls++;
   }
 
-  /** ストローク終了: 不透明度を掛けてレイヤーへ 1 回だけ焼く。 */
-  endStroke(opacity: number): void {
-    this.blit(this.stroke, this.layer, opacity, false, false);
-    this.clearTarget(this.stroke);
-    this.clearTarget(this.predict);
-  }
-
-  cancelStroke(): void {
-    this.clearTarget(this.stroke);
-    this.clearTarget(this.predict);
-  }
-
-  clearLayer(): void {
-    this.blit(this.layer, this.layerPrev, 1, false, true);
-    this.hasPrev = true;
-    this.clearTarget(this.layer);
-  }
-
-  /** 1 段だけの Undo(フェーズ 0)。差分 Undo はフェーズ 1。 */
-  undo(): boolean {
-    if (!this.hasPrev) return false;
-    const t = this.layer;
-    this.layer = this.layerPrev;
-    this.layerPrev = t;
-    this.hasPrev = false;
-    return true;
-  }
-
-  private blit(src: Target, dst: Target | null, opacity: number, dither: boolean, replace: boolean): void {
+  /** ストロークバッファの矩形を読み戻す(プリマルチ RGBA8、行 0 = y)。 */
+  readStroke(x: number, y: number, w: number, h: number): Uint8Array {
     const gl = this.gl;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, dst ? dst.fbo : null);
-    gl.viewport(0, 0, this.width, this.height);
-    if (replace) {
-      gl.clearColor(0, 0, 0, 0);
-      gl.clear(gl.COLOR_BUFFER_BIT);
+    const out = new Uint8Array(w * h * 4);
+    if (!this.stroke || w <= 0 || h <= 0) return out;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.stroke.fbo);
+    gl.pixelStorei(gl.PACK_ALIGNMENT, 1);
+    gl.readPixels(x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, out);
+    return out;
+  }
+
+  endStroke(): void {
+    this.clearTarget(this.stroke);
+    this.clearTarget(this.predict);
+  }
+
+  private blit(
+    src: Target | null,
+    dst: Target | null,
+    m: Mat3,
+    opacity: number,
+    dither: boolean,
+    mode: 0 | 1 | 2,
+    solid: [number, number, number, number] = [0, 0, 0, 0]
+  ): void {
+    const gl = this.gl;
+    if (dst) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo);
+      gl.viewport(0, 0, dst.w, dst.h);
+    } else {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, this.viewW, this.viewH);
     }
     gl.useProgram(this.blitProg);
+    gl.uniform2f(this.u.uDoc!, this.docW, this.docH);
+    gl.uniformMatrix3fv(this.u.uM!, false, m);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, src.tex);
-    gl.uniform1i(this.uBlitTex, 0);
-    gl.uniform1f(this.uBlitOpacity, opacity);
-    gl.uniform1f(this.uBlitDither, dither ? 1 : 0);
+    gl.bindTexture(gl.TEXTURE_2D, src ? src.tex : null);
+    gl.uniform1i(this.u.uTex!, 0);
+    gl.uniform1f(this.u.uOpacity!, opacity);
+    gl.uniform1f(this.u.uDither!, dither ? 1 : 0);
+    gl.uniform1i(this.u.uMode!, mode);
+    gl.uniform4f(this.u.uSolid!, solid[0], solid[1], solid[2], solid[3]);
     gl.bindVertexArray(this.blitVao);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     this.drawCalls++;
   }
 
-  /** 画面へ: 白地 + レイヤー + ストローク(不透明度) + 予測。 */
-  present(strokeOpacity: number, showStroke = false, showPredict = false): void {
+  /** 画面へ: 外側は灰、紙は白、下まとめ + 編集中(+ ストローク + 予測)+ 上まとめ。 */
+  present(view: View, strokeOpacity: number, showStroke: boolean, showPredict: boolean): void {
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, this.width, this.height);
-    gl.clearColor(1, 1, 1, 1);
+    gl.viewport(0, 0, this.viewW, this.viewH);
+    gl.clearColor(0.2, 0.2, 0.22, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
-    this.blit(this.layer, null, 1, true, false);
-    if (showStroke) this.blit(this.stroke, null, strokeOpacity, true, false);
-    if (showPredict) this.blit(this.predict, null, strokeOpacity, false, false);
+    const m = presentMatrix(view, this.viewW, this.viewH);
+    this.blit(null, null, m, 1, false, 2, [1, 1, 1, 1]);
+    this.blit(this.below, null, m, 1, true, 0);
+    this.blit(this.active, null, m, 1, true, this.active?.a8 ? 1 : 0);
+    if (showStroke) this.blit(this.stroke, null, m, strokeOpacity, true, 0);
+    if (showPredict) this.blit(this.predict, null, m, strokeOpacity, false, 0);
+    this.blit(this.above, null, m, 1, true, 0);
   }
 
-  /** テスト用: レイヤーで alpha > 0 の画素数。遅いので本番では呼ばない。 */
+  /** テスト用: 編集中レイヤーで alpha > 0 の画素数。遅いので本番では呼ばない。 */
   countPainted(): number {
+    const t = this.active;
+    if (!t) return 0;
     const gl = this.gl;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.layer.fbo);
-    const buf = new Uint8Array(this.width * this.height * 4);
-    gl.readPixels(0, 0, this.width, this.height, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo);
+    const buf = new Uint8Array(t.w * t.h * 4);
+    gl.readPixels(0, 0, t.w, t.h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
     let n = 0;
-    for (let i = 3; i < buf.length; i += 4) if (buf[i]! > 0) n++;
+    const ch = t.a8 ? 0 : 3;
+    for (let i = ch; i < buf.length; i += 4) if (buf[i]! > 0) n++;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     return n;
+  }
+
+  /** FBO 同士の等倍コピー用の行列(今は使っていないが、タイル合成で使う)。 */
+  static fboMatrix(w: number, h: number): Mat3 {
+    return fboMatrix(w, h);
   }
 }

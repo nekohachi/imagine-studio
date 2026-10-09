@@ -7,6 +7,9 @@
 //! - 出力は [x, y, radius, opacity] の 4 要素ずつ詰めた Float32Array。
 //!   レンダラはこれをそのままインスタンス属性にする。
 
+mod doc;
+pub use doc::Doc;
+
 use brush_core::{BrushParams, InputPoint, StrokeEngine};
 use wasm_bindgen::prelude::*;
 

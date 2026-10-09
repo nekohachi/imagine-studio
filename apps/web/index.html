@@ -128,9 +128,16 @@
       <label>不透明 <input id="opacity" type="range" min="0.05" max="1" step="0.05" value="1" /><span id="opacityV">1</span></label>
       <label><input id="predict" type="checkbox" checked /> 予測</label>
       <label><input id="finger" type="checkbox" /> 指で描く</label>
+      <label><input id="eraser" type="checkbox" /> 消しゴム</label>
       <input id="color" type="color" value="#1a1a1a" />
+      <label>レイヤー <select id="layer"></select></label>
+      <label><input id="visible" type="checkbox" checked /> 表示</label>
+      <button id="addLayer">＋レイヤー</button>
       <button id="undo">戻す</button>
+      <button id="redo">やり直す</button>
       <button id="clear">消去</button>
+      <button id="fit">全体</button>
+      <button id="png">PNG</button>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
