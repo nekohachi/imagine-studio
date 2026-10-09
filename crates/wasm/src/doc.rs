@@ -233,6 +233,31 @@ impl Doc {
         js_sys::Int32Array::from(&[b.x, b.y, b.w, b.h][..])
     }
 
+    // ---- 色調補正、フィルタ、大きさ ----
+
+    /// 色調補正を編集中レイヤーに確定する(JSON は canvas-core の Adjust)。
+    pub fn adjust_layer(&mut self, layer: u32, json: &str) -> Result<js_sys::Int32Array, JsError> {
+        let adj = canvas_core::Adjust::from_json(json).map_err(|e| JsError::new(&e))?;
+        Ok(keys_to_array(&self.inner.adjust_layer(layer, &adj)))
+    }
+    /// 仮表示用の変換表(256 要素)。
+    pub fn adjust_lut(json: &str) -> Result<js_sys::Uint8Array, JsError> {
+        let adj = canvas_core::Adjust::from_json(json).map_err(|e| JsError::new(&e))?;
+        Ok(js_sys::Uint8Array::from(&adj.lut()[..]))
+    }
+    pub fn blur_layer(&mut self, layer: u32, radius: f32) -> js_sys::Int32Array {
+        keys_to_array(&self.inner.blur_layer(layer, radius))
+    }
+    pub fn sharpen_layer(&mut self, layer: u32, radius: f32, amount: f32) -> js_sys::Int32Array {
+        keys_to_array(&self.inner.sharpen_layer(layer, radius, amount))
+    }
+    pub fn resize_canvas(&mut self, w: u32, h: u32, ax: f32, ay: f32) {
+        self.inner.resize_canvas(w, h, ax, ay);
+    }
+    pub fn resize_image(&mut self, w: u32, h: u32) {
+        self.inner.resize_image(w, h);
+    }
+
     // ---- 変形 ----
 
     /// 持ち上げる。戻り値は [x, y, w, h]。何も無ければ長さ 0。

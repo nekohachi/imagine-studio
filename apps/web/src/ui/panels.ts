@@ -1,7 +1,7 @@
 // パネルの中身: ブラシ、レイヤー、カラー、アクション。輪のメニューもここで組む。
 import { attachRadialButton, openRadial, type RadialItem, type RadialMenu } from "@imagine/ring";
 import type { Bridge } from "../bridge";
-import type { BrushJson, BrushPreset, LayerInfo } from "../protocol";
+import { ADJUST_IDENTITY, isAdjustIdentity, type AdjustParams, type BrushJson, type BrushPreset, type LayerInfo } from "../protocol";
 import type { AppState } from "../state";
 import { ColorPicker, DEFAULT_PALETTE, hexToRgb, rgbToHex, type Rgb } from "./color";
 import { ICONS, svgIcon } from "./icons";
@@ -33,7 +33,112 @@ export interface Ctx {
     transformCommit: () => void;
     transformCancel: () => void;
     transformDelta: (delta: [number, number, number, number, number, number]) => void;
+    /** 調整: 仮表示 / 確定 / 取消 */
+    adjustPreview: () => void;
+    adjustCommit: () => void;
+    adjustCancel: () => void;
+    /** 大きさ: キャンバス(画素はそのまま)/ 画像(拡縮) */
+    resizeCanvas: () => void;
+    resizeImage: () => void;
   };
+}
+
+// ---- 調整(色調補正・フィルタ・大きさ) ----
+
+export function renderAdjustPanel(body: HTMLElement, ctx: Ctx): void {
+  const { state, bridge, act } = ctx;
+  if (!state.adjust) state.adjust = { ...ADJUST_IDENTITY };
+  const a = state.adjust;
+  body.append(el.title(`色調補正${state.hasSelection ? "(選択範囲の中だけ)" : ""}`));
+  const help = document.createElement("div");
+  help.className = "phelp";
+  help.textContent = "編集中レイヤーに掛かります。動かすと仮表示、「適用」で確定(戻せます)。";
+  body.append(help);
+  // スライダは整数で持ち、scale で割って 0..1 に戻す
+  const num = (key: keyof AdjustParams, label: string, min: number, max: number, step: number, scale: number) => {
+    body.append(
+      el.slider(label, min, max, step, Math.round(a[key] * scale * 1000) / 1000, (v) => {
+        a[key] = v / scale;
+        act.adjustPreview();
+      })
+    );
+  };
+  num("brightness", "明るさ", -100, 100, 1, 100);
+  num("contrast", "コントラスト", -100, 100, 1, 100);
+  num("hue", "色相", -180, 180, 1, 1);
+  num("saturation", "彩度", -100, 100, 1, 100);
+  num("lightness", "明度", -100, 100, 1, 100);
+  const lv = document.createElement("details");
+  lv.className = "pjson";
+  lv.open = a.in_black !== 0 || a.in_white !== 1 || a.gamma !== 1 || a.out_black !== 0 || a.out_white !== 1;
+  lv.innerHTML = "<summary>レベル補正</summary>";
+  const lvBody = document.createElement("div");
+  const lvNum = (key: keyof AdjustParams, label: string, min: number, max: number, step: number, scale: number) => {
+    lvBody.append(
+      el.slider(label, min, max, step, Math.round(a[key] * scale * 1000) / 1000, (v) => {
+        a[key] = v / scale;
+        act.adjustPreview();
+      })
+    );
+  };
+  lvNum("in_black", "入力の黒", 0, 254, 1, 255);
+  lvNum("in_white", "入力の白", 1, 255, 1, 255);
+  lvNum("gamma", "ガンマ", 0.1, 3, 0.05, 1);
+  lvNum("out_black", "出力の黒", 0, 254, 1, 255);
+  lvNum("out_white", "出力の白", 1, 255, 1, 255);
+  lv.append(lvBody);
+  body.append(lv);
+  body.append(
+    el.row(
+      el.button("適用", act.adjustCommit, "fit", isAdjustIdentity(a) ? "" : "on"),
+      el.button("リセット", () => {
+        Object.assign(a, ADJUST_IDENTITY);
+        act.adjustPreview();
+        ctx.shell.rerender();
+      }, "clear"),
+      el.button("取消", act.adjustCancel)
+    )
+  );
+
+  body.append(el.title("フィルタ"));
+  body.append(
+    el.slider("半径(px)", 0.5, 64, 0.5, state.filterRadius, (v) => {
+      state.filterRadius = v;
+    }),
+    el.slider("シャープの強さ", 0.1, 3, 0.1, state.filterAmount, (v) => {
+      state.filterAmount = v;
+    })
+  );
+  const filter = (kind: "blur" | "sharpen") => () => {
+    // 仮表示中の色調補正があれば先に確定してから掛ける
+    if (state.adjust && !isAdjustIdentity(state.adjust)) act.adjustCommit();
+    bridge.send({ type: "filter", kind, radius: state.filterRadius, amount: state.filterAmount });
+    ctx.shell.toast(kind === "blur" ? "ぼかしました" : "シャープにしました");
+  };
+  body.append(el.row(el.button("ぼかし(ガウス)", filter("blur")), el.button("シャープ", filter("sharpen"))));
+
+  body.append(el.title(`大きさ(今 ${state.docW}×${state.docH})`));
+  const anchor = document.createElement("div");
+  anchor.className = "anchor-grid";
+  for (let y = 0; y < 3; y++) {
+    for (let x = 0; x < 3; x++) {
+      const b = document.createElement("button");
+      const on = state.resizeAnchor[0] === x / 2 && state.resizeAnchor[1] === y / 2;
+      b.className = "anchor" + (on ? " on" : "");
+      b.title = "キャンバスを広げる・切るときの寄せ";
+      b.addEventListener("click", () => {
+        state.resizeAnchor = [x / 2, y / 2];
+        ctx.shell.rerender();
+      });
+      anchor.appendChild(b);
+    }
+  }
+  const sizeRow = el.row(anchor, el.button("キャンバスサイズ", act.resizeCanvas, "select"), el.button("画像サイズ", act.resizeImage, "transform"));
+  body.append(sizeRow);
+  const help2 = document.createElement("div");
+  help2.className = "phelp";
+  help2.textContent = "キャンバスサイズは画素をそのまま足す・切る(左の寄せで位置)。画像サイズは絵ごと拡縮。どちらも履歴は消えます。";
+  body.append(help2);
 }
 
 // ---- 変形 ----

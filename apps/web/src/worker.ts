@@ -689,6 +689,61 @@ async function handle(m: ToWorker): Promise<void> {
       }
       return;
     }
+    case "adjustPreview": {
+      // GPU で仮表示。確定(adjustCommit)まで画素は変えない
+      if (!renderer) return;
+      const a = m.adjust;
+      renderer.setAdjust(Doc.adjust_lut(JSON.stringify(a)), [a.hue / 360, a.saturation, a.lightness]);
+      present();
+      return;
+    }
+    case "adjustCommit": {
+      if (!doc || !renderer) return;
+      const t0 = performance.now();
+      renderer.setAdjust(null);
+      uploadActiveTiles(doc.adjust_layer(active, JSON.stringify(m.adjust)));
+      lastBakeMs = performance.now() - t0;
+      present();
+      scheduleAutosave();
+      post({ type: "stats", stats: stats(t0, 0, 0) });
+      return;
+    }
+    case "adjustCancel":
+      renderer?.setAdjust(null);
+      present();
+      return;
+    case "filter": {
+      if (!doc) return;
+      const t0 = performance.now();
+      const changed = m.kind === "blur" ? doc.blur_layer(active, m.radius) : doc.sharpen_layer(active, m.radius, m.amount);
+      uploadActiveTiles(changed);
+      lastBakeMs = performance.now() - t0;
+      present();
+      scheduleAutosave();
+      post({ type: "stats", stats: stats(t0, 0, 0) });
+      return;
+    }
+    case "resizeCanvas":
+    case "resizeImage": {
+      if (!doc || !renderer) return;
+      if (floatM) {
+        uploadActiveTiles(doc.cancel_transform());
+        floatM = null;
+        renderer.clearFloating();
+        post({ type: "floating", rect: null });
+      }
+      if (m.type === "resizeCanvas") doc.resize_canvas(m.w, m.h, m.ax, m.ay);
+      else doc.resize_image(m.w, m.h);
+      renderer.setDocSize(doc.width, doc.height, doc.layer_format(active) === 1);
+      uploadActiveAll();
+      rebuildMerged();
+      syncSelection();
+      present();
+      scheduleAutosave();
+      post({ type: "doc", docW: doc.width, docH: doc.height, layers: layerInfos(), active });
+      post({ type: "stats", stats: stats(performance.now(), 0, 0) });
+      return;
+    }
     case "exportPng":
       await exportPng(m.id);
       return;

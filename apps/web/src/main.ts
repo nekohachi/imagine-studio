@@ -3,7 +3,7 @@ import "@imagine/ring/ring.css";
 import { Gauge, Modifiers, attachRadialButton, type RadialMenu } from "@imagine/ring";
 import { Bridge } from "./bridge";
 import { CanvasInput } from "./canvasInput";
-import type { BrushJson, BrushPreset, LayerInfo, Stats } from "./protocol";
+import { isAdjustIdentity, type BrushJson, type BrushPreset, type LayerInfo, type Stats } from "./protocol";
 import { AppState } from "./state";
 import { hexToRgb, rgbToHex, type Rgb } from "./ui/color";
 import { ICONS } from "./ui/icons";
@@ -11,10 +11,10 @@ import {
   canvasMenu,
   canvasMenuList,
   renderActionsPanel,
+  renderAdjustPanel,
   renderBrushPanel,
   renderColorPanel,
   renderFillPanel,
-  renderLaterPanel,
   renderLayersPanel,
   renderSelectPanel,
   renderTransformPanel,
@@ -192,8 +192,50 @@ const ctx: Ctx = {
       state.emit("tool");
     },
     transformDelta: (delta) => input.applyToTransform(delta),
+    adjustPreview: () => {
+      if (!state.adjust) return;
+      bridge.send({ type: "adjustPreview", adjust: { ...state.adjust } });
+    },
+    adjustCommit: () => {
+      const a = state.adjust;
+      state.adjust = null;
+      if (a && !isAdjustIdentity(a)) {
+        bridge.send({ type: "adjustCommit", adjust: a });
+        shell.toast("色調補正を適用しました");
+      } else {
+        bridge.send({ type: "adjustCancel" });
+      }
+      if (shell.panelOpen() === "adjust") shell.closePanel();
+    },
+    adjustCancel: () => {
+      state.adjust = null;
+      bridge.send({ type: "adjustCancel" });
+      if (shell.panelOpen() === "adjust") shell.closePanel();
+    },
+    resizeCanvas: () => {
+      const size = askSize("キャンバスの大きさ(幅x高さ、px)。画素はそのまま、履歴は消えます");
+      if (!size) return;
+      bridge.send({ type: "resizeCanvas", w: size[0], h: size[1], ax: state.resizeAnchor[0], ay: state.resizeAnchor[1] });
+    },
+    resizeImage: () => {
+      const size = askSize("画像の大きさ(幅x高さ、px)。絵ごと拡縮、履歴は消えます");
+      if (!size) return;
+      bridge.send({ type: "resizeImage", w: size[0], h: size[1] });
+    },
   },
 };
+
+/** 幅x高さを聞く。空や読めない入力は null。 */
+function askSize(msg: string): [number, number] | null {
+  const ans = window.prompt(msg, `${state.docW}x${state.docH}`);
+  if (!ans) return null;
+  const m = /^\s*(\d+)\s*[x×*,\s]\s*(\d+)\s*$/i.exec(ans);
+  if (!m) {
+    shell.toast("「幅x高さ」で入力してください");
+    return null;
+  }
+  return [Math.min(8192, Math.max(16, Number(m[1]))), Math.min(8192, Math.max(16, Number(m[2])))];
+}
 bridge.on("floating", (m) => {
   state.transform = m.rect ? { rect: m.rect, m: [1, 0, 0, 1, 0, 0] } : null;
   input.refreshOverlay();
@@ -231,7 +273,7 @@ const input = new CanvasInput(canvas, state, bridge, mods, {
     if (!shell.panelOpen()) return false;
     // 選択と塗りのパネルは開いたまま使う(タップが操作なので)
     const open = shell.panelOpen();
-    if (open === "select" || open === "fill" || open === "transform") return false;
+    if (open === "select" || open === "fill" || open === "transform" || open === "adjust") return false;
     shell.closePanel();
     return true;
   },
@@ -242,7 +284,18 @@ const input = new CanvasInput(canvas, state, bridge, mods, {
 const panels: Record<string, () => void> = {
   gallery: () => shell.openPanel("gallery", (b) => renderActionsPanel(b, ctx)),
   actions: () => shell.openPanel("actions", (b) => renderActionsPanel(b, ctx)),
-  adjust: () => shell.openPanel("adjust", (b) => renderLaterPanel(b, "調整")),
+  adjust: () =>
+    shell.openPanel(
+      "adjust",
+      (b) => renderAdjustPanel(b, ctx),
+      () => {
+        // 閉じたら仮表示を戻す(「適用」は closePanel の前に state.adjust を null にしている)
+        if (state.adjust) {
+          state.adjust = null;
+          bridge.send({ type: "adjustCancel" });
+        }
+      }
+    ),
   select: () => shell.openPanel("select", (b) => renderSelectPanel(b, ctx)),
   transform: () => shell.openPanel("transform", (b) => renderTransformPanel(b, ctx)),
   fill: () => shell.openPanel("fill", (b) => renderFillPanel(b, ctx)),
@@ -419,7 +472,7 @@ function renderHud(): void {
   const avg = frameHist.length ? frameHist.reduce((a, b) => a + b, 0) / frameHist.length : 0;
   const max = frameHist.length ? Math.max(...frameHist) : 0;
   hud.textContent = [
-    `Imagine Studio · Phase 3 · ${__BUILD__}`,
+    `Imagine Studio · Phase 4 · ${__BUILD__}`,
     `wasm ${state.ready.version}  ${state.ready.renderer.slice(0, 40)}`,
     `desync ${state.ready.desynchronized ? "on" : "off"}  raw ${input.hasRawUpdate ? "on" : "off"}  predict ${input.hasPredicted ? "on" : "off"}  dpr ${input.dpr}`,
     `doc ${state.docW}×${state.docH}  zoom ${(state.view.scale * 100).toFixed(0)}%  rot ${((state.view.rot * 180) / Math.PI).toFixed(0)}°`,
@@ -463,9 +516,14 @@ window.addEventListener("keydown", (e) => {
     panels.fill!();
   } else if (k === "t") {
     panels.transform!();
+  } else if ((e.ctrlKey || e.metaKey) && k === "u") {
+    e.preventDefault();
+    panels.adjust!();
   } else if (k === "enter" && state.transform) {
     ctx.act.transformCommit();
     shell.closePanel();
+  } else if (k === "enter" && state.adjust) {
+    ctx.act.adjustCommit();
   } else if (k === "escape") {
     if (state.transform) ctx.act.transformCancel();
     shell.closePanel();

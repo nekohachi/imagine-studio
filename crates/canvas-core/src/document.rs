@@ -1,6 +1,7 @@
 //! Document: レイヤーの並びと履歴。フェーズ 1 ではラスターレイヤーだけ、フレームは 1 つ。
 //! グループ、マスク、ベクターなどの種別は docs/03 に沿って後で足す。
 
+use crate::adjust::{gaussian_blur, unsharp, Adjust};
 use crate::blend::{composite_pixel, BlendMode};
 use crate::cel::{Blend, Cel, Snapshot};
 use crate::history::{Entry, History};
@@ -258,6 +259,112 @@ impl Document {
             Some(l) => l.read_rgba(self.bounds()),
             None => self.flatten_rgba8(self.bounds()),
         }
+    }
+
+    // ---- 色調補正とフィルタ(編集中レイヤーに直接。選択範囲があればその中だけ) ----
+
+    /// レイヤーの画素を関数で書き換える(矩形は選択範囲か全面)。履歴に積む。
+    fn rewrite_layer(
+        &mut self,
+        layer: LayerId,
+        label: &str,
+        f: impl FnOnce(&mut Vec<u8>, usize, usize, Option<&[u8]>),
+    ) -> Vec<TileKey> {
+        let rect = self.selection_bounds().intersect(&self.bounds());
+        if rect.is_empty() {
+            return Vec::new();
+        }
+        let mask = self.selection.as_ref().map(|c| c.read_rect(rect));
+        let Some(l) = self.layer(layer) else { return Vec::new() };
+        if l.cel.format() != PixelFormat::Rgba8 {
+            // モノクロは A8 のまま扱えないので、いまは対象外
+            return Vec::new();
+        }
+        let mut px = l.cel.read_rect(rect);
+        let orig = mask.as_ref().map(|_| px.clone());
+        f(&mut px, rect.w as usize, rect.h as usize, mask.as_deref());
+        // マスクのある所だけ差し替える(フィルタがマスクを無視しても外へ漏れないように)
+        if let (Some(m), Some(o)) = (&mask, &orig) {
+            for ((p, q), &k) in px.chunks_exact_mut(4).zip(o.chunks_exact(4)).zip(m.iter()) {
+                if k == 255 {
+                    continue;
+                }
+                for c in 0..4 {
+                    p[c] = ((q[c] as u32 * (255 - k as u32) + p[c] as u32 * k as u32 + 127) / 255) as u8;
+                }
+            }
+        }
+        let Some(l) = self.layer_mut(layer) else { return Vec::new() };
+        let snap = l.cel.write_rect(rect, &px);
+        self.record(layer, label, snap)
+    }
+
+    pub fn adjust_layer(&mut self, layer: LayerId, adj: &Adjust) -> Vec<TileKey> {
+        if adj.is_identity() {
+            return Vec::new();
+        }
+        self.rewrite_layer(layer, "色調補正", |px, _w, _h, mask| adj.apply_premul(px, mask))
+    }
+
+    pub fn blur_layer(&mut self, layer: LayerId, radius: f32) -> Vec<TileKey> {
+        self.rewrite_layer(layer, "ぼかし", |px, w, h, _| gaussian_blur(px, w, h, radius))
+    }
+
+    pub fn sharpen_layer(&mut self, layer: LayerId, radius: f32, amount: f32) -> Vec<TileKey> {
+        self.rewrite_layer(layer, "シャープ", |px, w, h, _| unsharp(px, w, h, radius, amount))
+    }
+
+    // ---- 大きさの変更(履歴は捨てる) ----
+
+    /// キャンバスの大きさを変える(画素はそのまま、anchor 0..1 で寄せる)。
+    pub fn resize_canvas(&mut self, w: u32, h: u32, ax: f32, ay: f32) {
+        let w = w.max(1);
+        let h = h.max(1);
+        let dx = ((w as f32 - self.width as f32) * ax.clamp(0.0, 1.0)).round() as i32;
+        let dy = ((h as f32 - self.height as f32) * ay.clamp(0.0, 1.0)).round() as i32;
+        let old = self.bounds();
+        for l in &mut self.layers {
+            let px = l.cel.read_rect(old);
+            let mut cel = Cel::new(l.cel.format(), w, h);
+            cel.write_rect(Rect::new(dx, dy, old.w, old.h), &px);
+            cel.take_dirty();
+            l.cel = cel;
+        }
+        self.width = w;
+        self.height = h;
+        self.selection = None;
+        self.floating = None;
+        self.history.clear();
+    }
+
+    /// 画像の大きさを変える(全レイヤーを再標本化)。
+    pub fn resize_image(&mut self, w: u32, h: u32) {
+        let w = w.max(1);
+        let h = h.max(1);
+        let old = self.bounds();
+        let m = Affine {
+            a: w as f32 / self.width as f32,
+            b: 0.0,
+            c: 0.0,
+            d: h as f32 / self.height as f32,
+            e: 0.0,
+            f: 0.0,
+        };
+        let dst = Rect::new(0, 0, w as i32, h as i32);
+        for l in &mut self.layers {
+            let bpp = l.cel.format().bytes_per_pixel();
+            let px = l.cel.read_rect(old);
+            let out = resample(&px, old, bpp, &m, dst);
+            let mut cel = Cel::new(l.cel.format(), w, h);
+            cel.write_rect(dst, &out);
+            cel.take_dirty();
+            l.cel = cel;
+        }
+        self.width = w;
+        self.height = h;
+        self.selection = None;
+        self.floating = None;
+        self.history.clear();
     }
 
     // ---- 塗りつぶし ----
@@ -977,6 +1084,41 @@ mod tests {
         assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(10, 40, 1, 1))[3], 0);
         doc.cancel_transform();
         assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(10, 40, 1, 1))[3], 255);
+    }
+
+    #[test]
+    fn adjust_blur_and_resize() {
+        let mut doc = Document::new(32, 32, 1 << 20);
+        let a = doc.add_layer(PixelFormat::Rgba8, "a");
+        let r = Rect::new(0, 0, 32, 32);
+        doc.composite_stroke(a, r, &solid(r, [100, 100, 100, 255]), 1.0, Blend::Normal);
+        // 明るさ(選択範囲の中だけ)
+        doc.select_rect(Rect::new(0, 0, 16, 32), SelectMode::Replace);
+        let adj = Adjust { brightness: 0.5, ..Default::default() };
+        assert!(!doc.adjust_layer(a, &adj).is_empty());
+        let px = doc.layer(a).unwrap().cel.read_rect(Rect::new(0, 0, 32, 1));
+        assert!(px[0] > 200, "{}", px[0]);
+        assert_eq!(px[20 * 4], 100, "選択の外は変わらない");
+        doc.undo();
+        assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(0, 0, 1, 1))[0], 100);
+        doc.select_none();
+        // ぼかし: 境界が滑らかになる
+        doc.clear_layer(a);
+        let half = Rect::new(0, 0, 16, 32);
+        doc.composite_stroke(a, half, &solid(half, [0, 0, 0, 255]), 1.0, Blend::Normal);
+        doc.blur_layer(a, 4.0);
+        let px = doc.layer(a).unwrap().cel.read_rect(Rect::new(14, 5, 4, 1));
+        assert!(px[3] > px[3 * 4 + 3] && px[3 * 4 + 3] > 0, "{px:?}");
+        // キャンバスの大きさ: 右下に寄せる
+        doc.resize_canvas(64, 64, 1.0, 1.0);
+        assert_eq!(doc.width(), 64);
+        assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(32, 40, 1, 1))[3], 255);
+        assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(0, 0, 1, 1))[3], 0);
+        // 画像の大きさ: 半分にしても左上の黒は残る
+        doc.resize_image(32, 32);
+        assert_eq!(doc.height(), 32);
+        assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(17, 20, 1, 1))[3], 255);
+        assert!(!doc.history().can_undo());
     }
 
     #[test]

@@ -56,6 +56,37 @@ export interface LayerInfo {
   clip: boolean;
 }
 
+/** 色調補正のパラメータ(canvas-core の Adjust と同じ形。省いた項目は「変化なし」)。 */
+export interface AdjustParams {
+  brightness: number;
+  contrast: number;
+  hue: number;
+  saturation: number;
+  lightness: number;
+  in_black: number;
+  in_white: number;
+  gamma: number;
+  out_black: number;
+  out_white: number;
+}
+
+export const ADJUST_IDENTITY: AdjustParams = {
+  brightness: 0,
+  contrast: 0,
+  hue: 0,
+  saturation: 0,
+  lightness: 0,
+  in_black: 0,
+  in_white: 1,
+  gamma: 1,
+  out_black: 0,
+  out_white: 1,
+};
+
+export function isAdjustIdentity(a: AdjustParams): boolean {
+  return (Object.keys(ADJUST_IDENTITY) as Array<keyof AdjustParams>).every((k) => a[k] === ADJUST_IDENTITY[k]);
+}
+
 export type ToWorker =
   | {
       type: "init";
@@ -95,6 +126,12 @@ export type ToWorker =
   | { type: "transformCommit"; m: number[] }
   | { type: "transformCancel" }
   | { type: "line"; x0: number; y0: number; x1: number; y1: number; pressure: number; commit: boolean }
+  | { type: "adjustPreview"; adjust: AdjustParams }
+  | { type: "adjustCommit"; adjust: AdjustParams }
+  | { type: "adjustCancel" }
+  | { type: "filter"; kind: "blur" | "sharpen"; radius: number; amount: number }
+  | { type: "resizeCanvas"; w: number; h: number; ax: number; ay: number }
+  | { type: "resizeImage"; w: number; h: number }
   | { type: "clear" }
   | { type: "undo" }
   | { type: "redo" }

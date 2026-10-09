@@ -13,7 +13,8 @@ export interface Shell {
   buttons: Record<string, HTMLButtonElement>;
   gauges: { size: HTMLElement; opacity: HTMLElement };
   toast: (msg: string, ms?: number) => void;
-  openPanel: (name: PanelName, render: (body: HTMLElement) => void) => void;
+  /** onClose は閉じるとき(別のパネルに替わるときも)に 1 回呼ぶ */
+  openPanel: (name: PanelName, render: (body: HTMLElement) => void, onClose?: () => void) => void;
   closePanel: () => void;
   rerender: () => void;
   panelOpen: () => PanelName | null;
@@ -93,6 +94,7 @@ export function buildShell(root: HTMLElement): Shell {
 
   let open: PanelName | null = null;
   let renderFn: ((body: HTMLElement) => void) | null = null;
+  let closeFn: (() => void) | null = null;
   let toastTimer = 0;
 
   const shell: Shell = {
@@ -111,13 +113,19 @@ export function buildShell(root: HTMLElement): Shell {
         toastEl.hidden = true;
       }, ms) as unknown as number;
     },
-    openPanel(name, render) {
+    openPanel(name, render, onClose) {
       if (open === name) {
         shell.closePanel();
         return;
       }
+      if (closeFn) {
+        const f = closeFn;
+        closeFn = null;
+        f();
+      }
       open = name;
       renderFn = render;
+      closeFn = onClose ?? null;
       panel.dataset.name = name;
       panel.classList.toggle("left", ["gallery", "actions", "adjust", "select", "transform"].includes(name));
       panel.hidden = false;
@@ -127,6 +135,11 @@ export function buildShell(root: HTMLElement): Shell {
     closePanel() {
       open = null;
       renderFn = null;
+      if (closeFn) {
+        const f = closeFn;
+        closeFn = null;
+        f();
+      }
       panel.hidden = true;
       panelBody.innerHTML = "";
       for (const b of Object.values(buttons)) b.classList.remove("open");

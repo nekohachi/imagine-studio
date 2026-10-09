@@ -1,5 +1,5 @@
 // アプリの状態。UI はここを見て描き、変更は emit で知らせる。
-import type { BrushJson, BrushPreset, LayerInfo, Stats, View } from "./protocol";
+import type { AdjustParams, BrushJson, BrushPreset, LayerInfo, Stats, View } from "./protocol";
 import type { Rgb } from "./ui/color";
 
 export interface Settings {
@@ -79,6 +79,13 @@ export class AppState {
   /** 自動選択と塗りで見えている絵を参照する(偽なら編集中レイヤー) */
   sampleMerged = true;
   hasSelection = false;
+  /** 調整パネルで仮表示中のパラメータ。閉じたら null */
+  adjust: AdjustParams | null = null;
+  /** フィルタの半径(px)とシャープの強さ */
+  filterRadius = 4;
+  filterAmount = 1;
+  /** キャンバスサイズ変更の寄せ(0..1 × 0..1) */
+  resizeAnchor: [number, number] = [0.5, 0.5];
 
   private listeners = new Map<StateEvent, Set<() => void>>();
 

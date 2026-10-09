@@ -9,6 +9,7 @@
 //! GPU には触らない。ストロークの焼き込みは、GPU で描いたストロークバッファの
 //! 汚れた矩形を受け取って CPU で合成する(1 ストロークに 1 回)。
 
+pub mod adjust;
 pub mod blend;
 pub mod cel;
 pub mod document;
@@ -18,6 +19,7 @@ pub mod selection;
 pub mod tile;
 pub mod transform;
 
+pub use adjust::{gaussian_blur, unsharp, Adjust};
 pub use blend::{composite_pixel, BlendMode};
 pub use cel::{Blend, Cel};
 pub use document::{Document, Layer, LayerId};

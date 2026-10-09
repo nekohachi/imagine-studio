@@ -166,7 +166,54 @@ uniform int uActiveA8;
 uniform int uHasClip;
 uniform int uShowStroke;
 uniform int uShowPredict;
+// 色調補正の仮表示(canvas-core の Adjust と同じ式)。uHasAdj: 0 無し、1 LUT だけ、2 LUT + HSL
+uniform sampler2D uLut;      // 256×1 R8
+uniform sampler2D uSel;      // 選択範囲(あればその中だけ)
+uniform int uHasAdj;
+uniform int uAdjSel;
+uniform vec3 uHsl;           // 色相のずれ 0..1、彩度 -1..1、明度 -1..1
 out vec4 o;
+
+vec3 rgb2hsl(vec3 c) {
+  float mx = max(c.r, max(c.g, c.b));
+  float mn = min(c.r, min(c.g, c.b));
+  float l = (mx + mn) * 0.5;
+  if (mx - mn < 1e-6) return vec3(0.0, 0.0, l);
+  float d = mx - mn;
+  float s = l > 0.5 ? d / (2.0 - mx - mn) : d / (mx + mn);
+  float h;
+  if (mx == c.r) h = ((c.g - c.b) / d + (c.g < c.b ? 6.0 : 0.0)) / 6.0;
+  else if (mx == c.g) h = ((c.b - c.r) / d + 2.0) / 6.0;
+  else h = ((c.r - c.g) / d + 4.0) / 6.0;
+  return vec3(h, s, l);
+}
+float hue2rgb(float p, float q, float t) {
+  t = fract(t);
+  if (t < 1.0 / 6.0) return p + (q - p) * 6.0 * t;
+  if (t < 0.5) return q;
+  if (t < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+  return p;
+}
+vec3 hsl2rgb(vec3 hsl) {
+  if (hsl.y <= 0.0) return vec3(hsl.z);
+  float q = hsl.z < 0.5 ? hsl.z * (1.0 + hsl.y) : hsl.z + hsl.y - hsl.z * hsl.y;
+  float p = 2.0 * hsl.z - q;
+  return vec3(hue2rgb(p, q, hsl.x + 1.0 / 3.0), hue2rgb(p, q, hsl.x), hue2rgb(p, q, hsl.x - 1.0 / 3.0));
+}
+vec3 adjust(vec3 c) {
+  c = vec3(
+    texture(uLut, vec2((c.r * 255.0 + 0.5) / 256.0, 0.5)).r,
+    texture(uLut, vec2((c.g * 255.0 + 0.5) / 256.0, 0.5)).r,
+    texture(uLut, vec2((c.b * 255.0 + 0.5) / 256.0, 0.5)).r);
+  if (uHasAdj == 2) {
+    vec3 h = rgb2hsl(c);
+    h.x = fract(h.x + uHsl.x);
+    h.y = uHsl.y >= 0.0 ? h.y + (1.0 - h.y) * uHsl.y : h.y * (1.0 + uHsl.y);
+    h.z = uHsl.z >= 0.0 ? h.z + (1.0 - h.z) * uHsl.z : h.z * (1.0 + uHsl.z);
+    c = hsl2rgb(clamp(h, 0.0, 1.0));
+  }
+  return c;
+}
 
 float lum(vec3 c) { return dot(c, vec3(0.3, 0.59, 0.11)); }
 vec3 clipColor(vec3 c) {
@@ -222,6 +269,10 @@ void main() {
   float as = act.a;
   if (as <= 0.0) { o = back; return; }
   vec3 cs = act.rgb / as;
+  if (uHasAdj > 0) {
+    float k = uAdjSel == 1 ? texture(uSel, vDocUv).r : 1.0;
+    cs = mix(cs, adjust(cs), k);
+  }
   // 下まとめは紙の上で不透明なので αb = 1
   vec3 b = uMode == 0 ? cs : blendRgb(uMode, back.rgb, cs);
   o = vec4(as * b + (1.0 - as) * back.rgb, 1.0);
@@ -331,6 +382,9 @@ export class Renderer {
   private floating: { t: Target; x: number; y: number } | null = null;
   private selProg!: WebGLProgram;
   private s = {} as Record<string, WebGLUniformLocation>;
+  private lutTex!: WebGLTexture;
+  /** 色調補正の仮表示。null なら無し。hsl は [色相 0..1, 彩度 -1..1, 明度 -1..1] */
+  private adj: { hsl: [number, number, number]; useHsl: boolean } | null = null;
   private quadVbo!: WebGLBuffer;
   private unitVbo!: WebGLBuffer;
   private dabVbo!: WebGLBuffer;
@@ -405,9 +459,22 @@ export class Renderer {
       "uHasClip",
       "uShowStroke",
       "uShowPredict",
+      "uLut",
+      "uSel",
+      "uHasAdj",
+      "uAdjSel",
+      "uHsl",
     ]) {
       this.c[n] = gl.getUniformLocation(this.composeProg, n)!;
     }
+    // 色調補正の変換表(256×1 R8)。使わないときも 1 枚持っておく(未束縛のサンプラを避ける)
+    this.lutTex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, this.lutTex);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R8, 256, 1);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
     this.quadVbo = gl.createBuffer()!;
     gl.bindBuffer(gl.ARRAY_BUFFER, this.quadVbo);
@@ -515,6 +582,19 @@ export class Renderer {
 
   get hasSelection(): boolean {
     return this.sel !== null;
+  }
+
+  /** 色調補正の仮表示。lut は 256 要素、null で解除。 */
+  setAdjust(lut: Uint8Array | null, hsl: [number, number, number] = [0, 0, 0]): void {
+    if (!lut || lut.length !== 256) {
+      this.adj = null;
+      return;
+    }
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, this.lutTex);
+    gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 256, 1, gl.RED, gl.UNSIGNED_BYTE, lut);
+    this.adj = { hsl, useHsl: hsl[0] !== 0 || hsl[1] !== 0 || hsl[2] !== 0 };
   }
 
   /** 変形で持ち上げた画素(プリマルチ RGBA8、w × h)。 */
@@ -763,6 +843,13 @@ export class Renderer {
     bind(2, this.stroke, "uStroke");
     bind(3, this.predict, "uPredict");
     bind(4, this.clip, "uClip");
+    gl.activeTexture(gl.TEXTURE5);
+    gl.bindTexture(gl.TEXTURE_2D, this.lutTex);
+    gl.uniform1i(this.c.uLut!, 5);
+    bind(6, this.sel, "uSel");
+    gl.uniform1i(this.c.uHasAdj!, this.adj ? (this.adj.useHsl ? 2 : 1) : 0);
+    gl.uniform1i(this.c.uAdjSel!, this.adj && this.sel ? 1 : 0);
+    gl.uniform3f(this.c.uHsl!, this.adj?.hsl[0] ?? 0, this.adj?.hsl[1] ?? 0, this.adj?.hsl[2] ?? 0);
     gl.uniform1i(this.c.uMode!, blendMode | 0);
     gl.uniform1f(this.c.uOpacity!, activeVisible ? activeOpacity : 0);
     gl.uniform1f(this.c.uStrokeOp!, strokeOpacity);
