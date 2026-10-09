@@ -19,8 +19,8 @@ import { TwoFingerGesture, fitView, screenToDoc, zoomAt } from "./view";
 
 declare const __BUILD__: string;
 
-const DOC_W = 2048;
-const DOC_H = 2048;
+let DOC_W = 2048;
+let DOC_H = 2048;
 
 const canvas = document.getElementById("canvas") as HTMLCanvasElement;
 const hud = document.getElementById("hud")!;
@@ -113,6 +113,45 @@ inputs.visible.addEventListener("change", () =>
 
 let pngId = 0;
 $("png").addEventListener("click", () => send({ type: "exportPng", id: ++pngId }));
+
+let saveId = 0;
+$("save").addEventListener("click", () => send({ type: "save", id: ++saveId }));
+const fileInput = $<HTMLInputElement>("file");
+$("open").addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", async () => {
+  const f = fileInput.files?.[0];
+  fileInput.value = "";
+  if (!f) return;
+  const bytes = await f.arrayBuffer();
+  send({ type: "open", bytes }, [bytes]);
+});
+$("new").addEventListener("click", () => {
+  const ans = window.prompt("新しい作品の大きさ(幅x高さ、px)", `${DOC_W}x${DOC_H}`);
+  if (!ans) return;
+  const m = /^\s*(\d+)\s*[x×*,\s]\s*(\d+)\s*$/i.exec(ans);
+  if (!m) return;
+  const w = Math.min(8192, Math.max(16, Number(m[1])));
+  const h = Math.min(8192, Math.max(16, Number(m[2])));
+  if (!window.confirm(`今の作品を捨てて ${w}×${h} で始めますか?`)) return;
+  send({ type: "newDoc", docW: w, docH: h });
+});
+
+function download(blob: Blob, name: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+function setDocSize(w: number, h: number): void {
+  DOC_W = w;
+  DOC_H = h;
+  const [vw, vh] = backing();
+  view = fitView(DOC_W, DOC_H, vw, vh);
+  send({ type: "view", view });
+}
 
 function applyLayers(layers: LayerInfo[], active: number): void {
   inputs.layer.innerHTML = "";
@@ -363,10 +402,19 @@ worker.onmessage = (e: MessageEvent<FromWorker>) => {
     case "ready":
       ready = m;
       applyLayers(m.layers, m.active);
+      if (m.docW !== DOC_W || m.docH !== DOC_H) setDocSize(m.docW, m.docH);
+      renderHud();
+      break;
+    case "doc":
+      applyLayers(m.layers, m.active);
+      setDocSize(m.docW, m.docH);
       renderHud();
       break;
     case "layers":
       applyLayers(m.layers, m.active);
+      break;
+    case "file":
+      download(new Blob([m.bytes], { type: "application/zip" }), `imagine-${Date.now()}.imst`);
       break;
     case "stats":
       last = m.stats;
@@ -376,15 +424,9 @@ worker.onmessage = (e: MessageEvent<FromWorker>) => {
       }
       renderHud();
       break;
-    case "png": {
-      const url = URL.createObjectURL(m.blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `imagine-${Date.now()}.png`;
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    case "png":
+      download(m.blob, `imagine-${Date.now()}.png`);
       break;
-    }
     case "readback":
       readbacks.get(m.id)?.(m.painted);
       readbacks.delete(m.id);

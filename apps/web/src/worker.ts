@@ -6,8 +6,11 @@ import wasmUrl from "./wasm/imagine_wasm_bg.wasm?url";
 import { Renderer } from "./gl";
 import { extrapolateDabs } from "./input";
 import type { BrushSettings, FromWorker, LayerInfo, Stats, ToWorker, View } from "./protocol";
+import { idbGet, idbPut } from "./storage";
 
 const HISTORY_MB = 64;
+const AUTOSAVE_KEY = "autosave";
+const AUTOSAVE_DELAY_MS = 2000;
 
 let renderer: Renderer | null = null;
 let doc: Doc | null = null;
@@ -109,6 +112,52 @@ function present(showStroke = false, showPredict = false): void {
   renderer?.present(view, settings.opacity, showStroke, showPredict);
 }
 
+// ---- 自動保存(変更から 2 秒後、連続する変更はまとめる) ----
+let autosaveTimer = 0;
+let autosaveBusy = false;
+let autosaveAgain = false;
+
+async function autosaveNow(): Promise<void> {
+  if (!doc) return;
+  if (autosaveBusy) {
+    autosaveAgain = true;
+    return;
+  }
+  autosaveBusy = true;
+  try {
+    await idbPut(AUTOSAVE_KEY, doc.save());
+  } catch (e) {
+    post({ type: "error", message: "自動保存に失敗: " + String(e) });
+  } finally {
+    autosaveBusy = false;
+    if (autosaveAgain) {
+      autosaveAgain = false;
+      scheduleAutosave();
+    }
+  }
+}
+
+function scheduleAutosave(): void {
+  if (autosaveTimer) clearTimeout(autosaveTimer);
+  autosaveTimer = setTimeout(() => {
+    autosaveTimer = 0;
+    void autosaveNow();
+  }, AUTOSAVE_DELAY_MS) as unknown as number;
+}
+
+/** 作品を差し替えて、GPU に載せ直す。 */
+function mountDoc(next: Doc): void {
+  if (doc && doc !== next) doc.free();
+  doc = next;
+  const ids = Array.from(doc.layer_ids());
+  if (ids.length === 0) doc.add_layer(false, "レイヤー 1");
+  active = Array.from(doc.layer_ids()).at(-1)!;
+  renderer?.setDocSize(doc.width, doc.height, doc.layer_format(active) === 1);
+  uploadActiveAll();
+  rebuildMerged();
+  present();
+}
+
 function growBbox(dabs: Float32Array): void {
   for (let i = 0; i + 3 < dabs.length; i += 4) {
     const x = dabs[i]!;
@@ -184,15 +233,25 @@ async function handle(m: ToWorker): Promise<void> {
       await init({ module_or_path: wasmUrl });
       brush = new Brush();
       applyBrush();
-      doc = new Doc(m.docW, m.docH, HISTORY_MB);
-      doc.add_layer(false, "レイヤー 1");
-      active = doc.add_layer(false, "レイヤー 2");
       view = m.view;
       renderer = new Renderer(m.canvas, m.viewW, m.viewH);
-      renderer.setDocSize(m.docW, m.docH, false);
-      uploadActiveAll();
-      rebuildMerged();
-      present();
+      let restored = false;
+      let next: Doc | null = null;
+      try {
+        const saved = await idbGet(AUTOSAVE_KEY);
+        if (saved && saved.length) {
+          next = Doc.load(saved, HISTORY_MB);
+          restored = true;
+        }
+      } catch (e) {
+        post({ type: "error", message: "自動保存の読み込みに失敗(新規で始めます): " + String(e) });
+      }
+      if (!next) {
+        next = new Doc(m.docW, m.docH, HISTORY_MB);
+        next.add_layer(false, "レイヤー 1");
+        next.add_layer(false, "レイヤー 2");
+      }
+      mountDoc(next);
       post({
         type: "ready",
         version: version(),
@@ -200,6 +259,9 @@ async function handle(m: ToWorker): Promise<void> {
         desynchronized: renderer.desynchronized,
         layers: layerInfos(),
         active,
+        docW: doc!.width,
+        docH: doc!.height,
+        restored,
       });
       post({ type: "stats", stats: stats(performance.now(), 0, 0) });
       return;
@@ -266,6 +328,7 @@ async function handle(m: ToWorker): Promise<void> {
       bbox = null;
       renderer.endStroke();
       present();
+      scheduleAutosave();
       post({ type: "stats", stats: stats(t0, dabs.length / 4, 0) });
       return;
     }
@@ -295,6 +358,7 @@ async function handle(m: ToWorker): Promise<void> {
       uploadActiveAll();
       rebuildMerged();
       present();
+      scheduleAutosave();
       post({ type: "layers", layers: layerInfos(), active });
       return;
     }
@@ -303,6 +367,7 @@ async function handle(m: ToWorker): Promise<void> {
       doc.set_layer_visible(m.id, m.visible);
       if (m.id !== active) rebuildMerged();
       present();
+      scheduleAutosave();
       post({ type: "layers", layers: layerInfos(), active });
       return;
     }
@@ -312,6 +377,7 @@ async function handle(m: ToWorker): Promise<void> {
       renderer.clearActive();
       renderer.finishActiveUpload();
       present();
+      scheduleAutosave();
       post({ type: "stats", stats: stats(performance.now(), 0, 0) });
       return;
     }
@@ -322,6 +388,7 @@ async function handle(m: ToWorker): Promise<void> {
       if (changed.length) {
         applyChanged(changed);
         present();
+        scheduleAutosave();
       }
       post({ type: "stats", stats: stats(performance.now(), 0, 0) });
       return;
@@ -329,6 +396,31 @@ async function handle(m: ToWorker): Promise<void> {
     case "exportPng":
       await exportPng(m.id);
       return;
+    case "save": {
+      if (!doc) return;
+      const bytes = doc.save();
+      // Uint8Array は wasm メモリの外へのコピーなので、そのまま転送できる
+      post({ type: "file", id: m.id, bytes: bytes.buffer as ArrayBuffer }, [bytes.buffer as ArrayBuffer]);
+      return;
+    }
+    case "open": {
+      if (!renderer) return;
+      const next = Doc.load(new Uint8Array(m.bytes), HISTORY_MB);
+      mountDoc(next);
+      scheduleAutosave();
+      post({ type: "doc", docW: doc!.width, docH: doc!.height, layers: layerInfos(), active });
+      return;
+    }
+    case "newDoc": {
+      if (!renderer) return;
+      const next = new Doc(m.docW, m.docH, HISTORY_MB);
+      next.add_layer(false, "レイヤー 1");
+      next.add_layer(false, "レイヤー 2");
+      mountDoc(next);
+      scheduleAutosave();
+      post({ type: "doc", docW: doc!.width, docH: doc!.height, layers: layerInfos(), active });
+      return;
+    }
     case "readback":
       post({ type: "readback", id: m.id, painted: renderer ? renderer.countPainted() : -1 });
       return;

@@ -86,10 +86,26 @@ try {
 
   await page.screenshot({ path: "smoke.png" });
 
+  // 自動保存(2 秒後)を待って開き直し、復元されることを確かめる
+  await page.waitForTimeout(2600);
+  await page.reload();
+  await page.waitForFunction(() => window.__imagine && window.__imagine.ready().version !== "", null, {
+    timeout: 20000,
+  });
+  const restored = await page.evaluate(() => window.__imagine.readback());
+  if (restored !== after) fail(`自動保存から復元できていない: ${restored} (期待 ${after})`);
+  else console.log(`✅ 自動保存から復元 (painted=${restored})`);
+
+  // 復元直後は履歴が無いので、もう 1 本描いてから Undo を試す
+  await page.mouse.move(400, 300);
+  await page.mouse.down();
+  await page.mouse.move(500, 400, { steps: 10 });
+  await page.mouse.up();
+  await page.waitForTimeout(200);
   await page.click("#undo");
-  await page.waitForTimeout(100);
+  await page.waitForTimeout(200);
   const undone = await page.evaluate(() => window.__imagine.readback());
-  if (undone !== 0) fail(`Undo で消えない: ${undone}`);
+  if (undone !== after) fail(`Undo で戻らない: ${undone} (期待 ${after})`);
   else console.log("✅ Undo");
   if (errors.length) fail("ページエラー:\n" + errors.join("\n"));
 } finally {

@@ -40,6 +40,19 @@ impl Doc {
         }
     }
 
+    /// `.imst` のバイト列から復元する。
+    pub fn load(bytes: &[u8], history_mb: u32) -> Result<Doc, JsError> {
+        canvas_core::io::imst::load(bytes, (history_mb as usize) << 20)
+            .map(|inner| Doc { inner })
+            .map_err(|e| JsError::new(&e))
+    }
+
+    /// `.imst` のバイト列にする。
+    pub fn save(&self) -> js_sys::Uint8Array {
+        let v = canvas_core::io::imst::save(&self.inner);
+        js_sys::Uint8Array::from(v.as_slice())
+    }
+
     #[wasm_bindgen(getter)]
     pub fn width(&self) -> u32 {
         self.inner.width()

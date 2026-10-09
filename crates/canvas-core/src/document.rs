@@ -71,6 +71,29 @@ impl Document {
         id
     }
 
+    /// 読み込み用: id と属性を指定して足す(履歴には積まない)。id が既にあれば None。
+    pub fn add_layer_with(
+        &mut self,
+        id: LayerId,
+        format: PixelFormat,
+        name: &str,
+        visible: bool,
+        opacity: f32,
+    ) -> Option<&mut Layer> {
+        if self.index_of(id).is_some() {
+            return None;
+        }
+        self.next_id = self.next_id.max(id + 1);
+        self.layers.push(Layer {
+            id,
+            name: name.to_string(),
+            visible,
+            opacity: opacity.clamp(0.0, 1.0),
+            cel: Cel::new(format, self.width, self.height),
+        });
+        self.layers.last_mut()
+    }
+
     pub fn index_of(&self, id: LayerId) -> Option<usize> {
         self.layers.iter().position(|l| l.id == id)
     }

@@ -55,6 +55,9 @@ export type ToWorker =
   | { type: "undo" }
   | { type: "redo" }
   | { type: "exportPng"; id: number }
+  | { type: "save"; id: number }
+  | { type: "open"; bytes: ArrayBuffer }
+  | { type: "newDoc"; docW: number; docH: number }
   | { type: "readback"; id: number };
 
 export interface Stats {
@@ -86,9 +89,14 @@ export type FromWorker =
       desynchronized: boolean;
       layers: LayerInfo[];
       active: number;
+      docW: number;
+      docH: number;
+      restored: boolean;
     }
+  | { type: "doc"; docW: number; docH: number; layers: LayerInfo[]; active: number }
   | { type: "layers"; layers: LayerInfo[]; active: number }
   | { type: "stats"; stats: Stats }
   | { type: "png"; id: number; blob: Blob }
+  | { type: "file"; id: number; bytes: ArrayBuffer }
   | { type: "readback"; id: number; painted: number }
   | { type: "error"; message: string };

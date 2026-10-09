@@ -12,6 +12,7 @@
 pub mod cel;
 pub mod document;
 pub mod history;
+pub mod io;
 pub mod tile;
 
 pub use cel::{Blend, Cel};

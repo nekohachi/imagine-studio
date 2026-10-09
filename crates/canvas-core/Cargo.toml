@@ -5,3 +5,6 @@ edition.workspace = true
 description = "キャンバスのコア: 256×256 スパースタイル、8bit 画素、ダーティ追跡、タイル差分の履歴"
 
 [dependencies]
+miniz_oxide = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
