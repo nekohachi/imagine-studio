@@ -27,7 +27,94 @@ export interface Ctx {
     exportPng: () => void;
     eyedropOnce: () => void;
     thumbnails: () => void;
+    setTool: (tool: "brush" | "select" | "fill") => void;
   };
+}
+
+// ---- 選択 ----
+
+export function renderSelectPanel(body: HTMLElement, ctx: Ctx): void {
+  const { state, bridge, act } = ctx;
+  act.setTool("select");
+  body.append(el.title("選択"));
+  const tools = el.row();
+  for (const [key, label, icon] of [
+    ["rect", "矩形", "select"],
+    ["lasso", "投げ縄", "pen"],
+    ["wand", "自動選択", "dropper"],
+  ] as const) {
+    const b = el.button(label, () => {
+      state.selectTool = key;
+      ctx.shell.rerender();
+    }, icon, state.selectTool === key ? "on" : "");
+    tools.append(b);
+  }
+  body.append(tools);
+  if (state.selectTool === "wand") {
+    body.append(
+      el.slider("許容値", 0, 255, 1, state.tolerance, (v) => {
+        state.tolerance = v;
+      }),
+      el.toggle("つながった所だけ", state.contiguous, (v) => {
+        state.contiguous = v;
+      }),
+      el.toggle("見えている絵で判定(全レイヤー)", state.sampleMerged, (v) => {
+        state.sampleMerged = v;
+      })
+    );
+  }
+  const help = document.createElement("div");
+  help.className = "phelp";
+  help.textContent = "SHF を押しながらで足す、CTL を押しながらで引く。動かさずに離すと解除。";
+  body.append(help);
+  body.append(el.title("範囲"));
+  body.append(
+    el.row(
+      el.button("全て", () => bridge.send({ type: "select", kind: "all" })),
+      el.button("解除", () => bridge.send({ type: "select", kind: "none" })),
+      el.button("反転", () => bridge.send({ type: "select", kind: "invert" }))
+    )
+  );
+  body.append(el.title("範囲に対して"));
+  body.append(
+    el.row(
+      el.button("今の色で塗る", () => bridge.send({ type: "fillSelection" }), "grid"),
+      el.button("消去", () => bridge.send({ type: "deleteSelection" }), "clear")
+    )
+  );
+  body.append(el.title("ツールを戻す"));
+  body.append(el.button("ブラシへ", () => {
+    act.setTool("brush");
+    ctx.shell.closePanel();
+  }, "brush"));
+}
+
+// ---- 塗りつぶし ----
+
+export function renderFillPanel(body: HTMLElement, ctx: Ctx): void {
+  const { state, act } = ctx;
+  act.setTool("fill");
+  body.append(el.title("塗りつぶし(バケツ)"));
+  const help = document.createElement("div");
+  help.className = "phelp";
+  help.textContent = "キャンバスをタップした所から、似た色の範囲を今の色で塗ります。選択範囲があればその中だけ。";
+  body.append(help);
+  body.append(
+    el.slider("許容値", 0, 255, 1, state.tolerance, (v) => {
+      state.tolerance = v;
+    }),
+    el.toggle("つながった所だけ", state.contiguous, (v) => {
+      state.contiguous = v;
+    }),
+    el.toggle("見えている絵で判定(線画が別レイヤーでも塗れる)", state.sampleMerged, (v) => {
+      state.sampleMerged = v;
+    })
+  );
+  body.append(el.title("ツールを戻す"));
+  body.append(el.button("ブラシへ", () => {
+    act.setTool("brush");
+    ctx.shell.closePanel();
+  }, "brush"));
 }
 
 // ---- ブラシ ----
@@ -122,11 +209,29 @@ export function canvasMenu(ctx: Ctx): RadialMenu {
   const { act, shell } = ctx;
   const later = (label: string) => ({ label, sub: "フェーズ 4", icon: ICONS.grid, run: () => shell.toast(`${label}はフェーズ 4 で入ります`) });
   return {
-    N: { label: "ブラシ", sub: "一覧", icon: ICONS.brush, run: () => shell.openPanel("brush", (b) => renderBrushPanel(b, ctx)) },
+    N: {
+      label: "ブラシ",
+      sub: "一覧",
+      icon: ICONS.brush,
+      run: () => {
+        act.setTool("brush");
+        shell.openPanel("brush", (b) => renderBrushPanel(b, ctx));
+      },
+    },
     NE: { label: "消しゴム", sub: "切替", icon: ICONS.eraser, run: () => act.toggleEraser() },
-    E: later("選択"),
+    E: {
+      label: "選択",
+      sub: ctx.state.hasSelection ? "範囲あり" : undefined,
+      icon: ICONS.select,
+      run: () => shell.openPanel("select", (b) => renderSelectPanel(b, ctx)),
+    },
     SE: later("変形"),
-    S: later("塗り"),
+    S: {
+      label: "塗り",
+      sub: "バケツ",
+      icon: ICONS.grid,
+      run: () => shell.openPanel("fill", (b) => renderFillPanel(b, ctx)),
+    },
     SW: later("図形"),
     W: { label: "スポイト", sub: "次のタップ", icon: ICONS.dropper, run: () => act.eyedropOnce() },
     NW: { label: "レイヤー", icon: ICONS.layers, run: () => shell.openPanel("layers", (b) => renderLayersPanel(b, ctx)) },

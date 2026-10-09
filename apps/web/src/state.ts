@@ -68,6 +68,15 @@ export class AppState {
   /** 次のタップでスポイト(輪から) */
   eyedropOnce = false;
   uiHidden = false;
+  /** 今のツール。brush 以外はキャンバスのタップが描画にならない */
+  tool: "brush" | "select" | "fill" = "brush";
+  selectTool: "rect" | "lasso" | "wand" = "rect";
+  /** 自動選択と塗りの許容値 0..255 */
+  tolerance = 32;
+  contiguous = true;
+  /** 自動選択と塗りで見えている絵を参照する(偽なら編集中レイヤー) */
+  sampleMerged = true;
+  hasSelection = false;
 
   private listeners = new Map<StateEvent, Set<() => void>>();
 

@@ -227,6 +227,34 @@ void main() {
   o = vec4(as * b + (1.0 - as) * back.rgb, 1.0);
 }`;
 
+// 選択範囲の表示: 境界に白黒の破線、外側を少し暗く。画面空間で 1 回(アニメはしない。rAF を止めるため)
+const SEL_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+in vec2 vDocUv;
+uniform sampler2D uSel;
+uniform vec2 uDocSize;
+uniform float uScale;      // 画面 px / doc px
+out vec4 o;
+void main() {
+  bool inside = vDocUv.x >= 0.0 && vDocUv.y >= 0.0 && vDocUv.x <= 1.0 && vDocUv.y <= 1.0;
+  float s = inside ? texture(uSel, vDocUv).r : 0.0;
+  // 1 画面 px ぶん離れた所と比べて境界を出す
+  vec2 d = vec2(1.0) / (uDocSize * max(uScale, 1e-3));
+  float e = 0.0;
+  e = max(e, abs(texture(uSel, vDocUv + vec2(d.x, 0.0)).r - s));
+  e = max(e, abs(texture(uSel, vDocUv - vec2(d.x, 0.0)).r - s));
+  e = max(e, abs(texture(uSel, vDocUv + vec2(0.0, d.y)).r - s));
+  e = max(e, abs(texture(uSel, vDocUv - vec2(0.0, d.y)).r - s));
+  if (e > 0.5) {
+    float dash = step(0.5, fract((gl_FragCoord.x + gl_FragCoord.y) / 8.0));
+    o = vec4(vec3(dash), 1.0);
+    return;
+  }
+  // 外側は少し暗く(premultiplied の黒)
+  o = inside && s < 0.5 ? vec4(0.0, 0.0, 0.0, 0.12) : vec4(0.0);
+}`;
+
 interface Target {
   tex: WebGLTexture;
   fbo: WebGLFramebuffer;
@@ -286,6 +314,10 @@ export class Renderer {
   private p1: Target | null = null;
   /** クリッピングの土台のアルファ(R8、doc サイズ)。無ければ null */
   private clip: Target | null = null;
+  /** 選択範囲(R8、doc サイズ)。無ければ null */
+  private sel: Target | null = null;
+  private selProg!: WebGLProgram;
+  private s = {} as Record<string, WebGLUniformLocation>;
   private quadVbo!: WebGLBuffer;
   private unitVbo!: WebGLBuffer;
   private dabVbo!: WebGLBuffer;
@@ -338,6 +370,10 @@ export class Renderer {
     }
     for (const n of ["uDoc", "uM", "uTex", "uOpacity", "uDither", "uMode", "uSolid"]) {
       this.u[n] = gl.getUniformLocation(this.blitProg, n)!;
+    }
+    this.selProg = this.program(COMPOSE_VS, SEL_FS);
+    for (const n of ["uViewSize", "uDocSize", "uInv", "uSel", "uScale"]) {
+      this.s[n] = gl.getUniformLocation(this.selProg, n)!;
     }
     this.composeProg = this.program(COMPOSE_VS, COMPOSE_FS);
     for (const n of [
@@ -451,6 +487,23 @@ export class Renderer {
     this.p1 = this.target(this.viewW, this.viewH, false, false);
   }
 
+  /** 選択範囲(A8、doc 全面)。null か長さ 0 で解除。 */
+  uploadSelection(mask: Uint8Array | null): void {
+    const gl = this.gl;
+    if (!mask || mask.length === 0) {
+      this.sel = this.drop(this.sel);
+      return;
+    }
+    if (!this.sel) this.sel = this.target(this.docW, this.docH, true, false);
+    gl.bindTexture(gl.TEXTURE_2D, this.sel.tex);
+    gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.docW, this.docH, gl.RED, gl.UNSIGNED_BYTE, mask);
+  }
+
+  get hasSelection(): boolean {
+    return this.sel !== null;
+  }
+
   /** クリッピングの土台のアルファ(A8、doc 全面)。null で解除。 */
   uploadClip(alpha: Uint8Array | null): void {
     const gl = this.gl;
@@ -475,6 +528,7 @@ export class Renderer {
     this.stroke = this.drop(this.stroke);
     this.predict = this.drop(this.predict);
     this.clip = this.drop(this.clip);
+    this.sel = this.drop(this.sel);
     this.active = this.target(this.docW, this.docH, activeA8, true);
     this.below = this.target(this.docW, this.docH, false, true);
     this.above = this.target(this.docW, this.docH, false, true);
@@ -698,6 +752,22 @@ export class Renderer {
     gl.clearColor(0.2, 0.2, 0.22, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
     this.blitFull(p1, fm, true);
+
+    // 選択範囲の表示
+    if (this.sel) {
+      gl.useProgram(this.selProg);
+      gl.uniform2f(this.s.uViewSize!, this.viewW, this.viewH);
+      gl.uniform2f(this.s.uDocSize!, this.docW, this.docH);
+      gl.uniformMatrix3fv(this.s.uInv!, false, inverseView(view));
+      gl.uniform1f(this.s.uScale!, view.scale);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.sel.tex);
+      gl.uniform1i(this.s.uSel!, 0);
+      gl.bindVertexArray(this.blitVao);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      this.drawCalls++;
+    }
   }
 
   /** 画面サイズのテクスチャをそのまま画面(または FBO)へ。 */

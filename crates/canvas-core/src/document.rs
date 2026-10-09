@@ -4,6 +4,7 @@
 use crate::blend::{composite_pixel, BlendMode};
 use crate::cel::{Blend, Cel, Snapshot};
 use crate::history::{Entry, History};
+use crate::selection::{region_by_color, Mask, SelectMode};
 use crate::tile::{PixelFormat, Rect, TileKey};
 
 pub type LayerId = u32;
@@ -54,6 +55,8 @@ pub struct Document {
     layers: Vec<Layer>,
     next_id: LayerId,
     history: History,
+    /// 選択範囲(A8 全面)。None は「全部」
+    selection: Option<Cel>,
 }
 
 /// 変わったタイル(GPU が再転送すべきもの)。
@@ -67,7 +70,170 @@ impl Document {
             layers: Vec::new(),
             next_id: 1,
             history: History::new(history_limit_bytes),
+            selection: None,
         }
+    }
+
+    // ---- 選択範囲 ----
+
+    pub fn selection(&self) -> Option<&Cel> {
+        self.selection.as_ref()
+    }
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+    pub fn select_none(&mut self) {
+        self.selection = None;
+    }
+    pub fn select_all(&mut self) {
+        let mut m = Mask::new(self.width, self.height);
+        m.fill_rect(self.bounds(), 255);
+        self.selection = Some(m.to_cel());
+    }
+    pub fn select_invert(&mut self) {
+        let mut m = match &self.selection {
+            Some(c) => Mask::from_cel(c),
+            None => {
+                let mut m = Mask::new(self.width, self.height);
+                m.fill_rect(self.bounds(), 255);
+                m
+            }
+        };
+        m.invert();
+        self.set_selection_mask(m);
+    }
+    fn current_mask(&self) -> Mask {
+        match &self.selection {
+            Some(c) => Mask::from_cel(c),
+            None => Mask::new(self.width, self.height),
+        }
+    }
+    fn set_selection_mask(&mut self, m: Mask) {
+        self.selection = if m.is_empty() { None } else { Some(m.to_cel()) };
+    }
+    fn apply_selection(&mut self, new: Mask, mode: SelectMode) {
+        let mut cur = if mode == SelectMode::Replace { Mask::new(self.width, self.height) } else { self.current_mask() };
+        cur.combine(&new, if mode == SelectMode::Replace { SelectMode::Add } else { mode });
+        self.set_selection_mask(cur);
+    }
+    pub fn select_rect(&mut self, rect: Rect, mode: SelectMode) {
+        let mut m = Mask::new(self.width, self.height);
+        m.fill_rect(rect, 255);
+        self.apply_selection(m, mode);
+    }
+    pub fn select_polygon(&mut self, pts: &[(f32, f32)], mode: SelectMode) {
+        let mut m = Mask::new(self.width, self.height);
+        m.fill_polygon(pts, 255);
+        self.apply_selection(m, mode);
+    }
+    /// 自動選択。`layer` が None なら見えている絵(全レイヤー)で判定する。
+    pub fn select_wand(
+        &mut self,
+        layer: Option<LayerId>,
+        x: i32,
+        y: i32,
+        tolerance: u8,
+        contiguous: bool,
+        mode: SelectMode,
+    ) {
+        let px = self.reference_pixels(layer);
+        let m = region_by_color(&px, self.width, self.height, x, y, tolerance, contiguous);
+        self.apply_selection(m, mode);
+    }
+    /// 選択範囲を囲む矩形(無ければ全面)。
+    pub fn selection_bounds(&self) -> Rect {
+        match &self.selection {
+            Some(c) => Mask::from_cel(c).bounds(),
+            None => self.bounds(),
+        }
+    }
+    /// 塗りや自動選択が見る画素(プリマルチ RGBA8、全面)。
+    fn reference_pixels(&self, layer: Option<LayerId>) -> Vec<u8> {
+        match layer.and_then(|id| self.layer(id)) {
+            Some(l) => l.read_rgba(self.bounds()),
+            None => self.flatten_rgba8(self.bounds()),
+        }
+    }
+
+    // ---- 塗りつぶし ----
+
+    /// バケツ塗り。`reference` が None なら見えている絵で領域を決め、`layer` に塗る。
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill(
+        &mut self,
+        layer: LayerId,
+        reference: Option<LayerId>,
+        x: i32,
+        y: i32,
+        color: [u8; 4],
+        tolerance: u8,
+        contiguous: bool,
+    ) -> Vec<TileKey> {
+        let px = self.reference_pixels(reference);
+        let region = region_by_color(&px, self.width, self.height, x, y, tolerance, contiguous);
+        self.fill_mask(layer, &region, color)
+    }
+
+    /// 選択範囲(無ければ全面)を 1 色で塗る。
+    pub fn fill_selection(&mut self, layer: LayerId, color: [u8; 4]) -> Vec<TileKey> {
+        let m = match &self.selection {
+            Some(c) => Mask::from_cel(c),
+            None => {
+                let mut m = Mask::new(self.width, self.height);
+                m.fill_rect(self.bounds(), 255);
+                m
+            }
+        };
+        self.fill_mask(layer, &m, color)
+    }
+
+    fn fill_mask(&mut self, layer: LayerId, region: &Mask, color: [u8; 4]) -> Vec<TileKey> {
+        let b = region.bounds();
+        if b.is_empty() {
+            return Vec::new();
+        }
+        // 領域のアルファ × 色(プリマルチ)の矩形を作って焼く。選択範囲でも絞る
+        let mut src = vec![0u8; b.w as usize * b.h as usize * 4];
+        for y in 0..b.h as usize {
+            for x in 0..b.w as usize {
+                let k = region.data[(b.y as usize + y) * region.width as usize + b.x as usize + x] as u32;
+                if k == 0 {
+                    continue;
+                }
+                let o = (y * b.w as usize + x) * 4;
+                for c in 0..4 {
+                    src[o + c] = ((color[c] as u32 * k + 127) / 255) as u8;
+                }
+            }
+        }
+        let sel = self.selection.take();
+        let Some(l) = self.layer_mut(layer) else {
+            self.selection = sel;
+            return Vec::new();
+        };
+        let snap = l.cel.composite_masked(b, &src, 1.0, Blend::Normal, sel.as_ref());
+        self.selection = sel;
+        self.record(layer, "塗りつぶし", snap)
+    }
+
+    /// 選択範囲の中を消す。選択が無ければ何もしない(全部消すのは clear_layer)。
+    pub fn delete_selection(&mut self, layer: LayerId) -> Vec<TileKey> {
+        if self.selection.is_none() {
+            return Vec::new();
+        }
+        let b = self.selection_bounds();
+        if b.is_empty() {
+            return Vec::new();
+        }
+        let src = vec![255u8; b.w as usize * b.h as usize * 4];
+        let sel = self.selection.take();
+        let Some(l) = self.layer_mut(layer) else {
+            self.selection = sel;
+            return Vec::new();
+        };
+        let snap = l.cel.composite_masked(b, &src, 1.0, Blend::Erase, sel.as_ref());
+        self.selection = sel;
+        self.record(layer, "消去", snap)
     }
 
     pub fn width(&self) -> u32 {
@@ -288,8 +454,13 @@ impl Document {
         opacity: f32,
         blend: Blend,
     ) -> Vec<TileKey> {
-        let Some(l) = self.layer_mut(layer) else { return Vec::new() };
-        let snap = l.cel.composite(rect, src, opacity, blend);
+        let sel = self.selection.take();
+        let Some(l) = self.layer_mut(layer) else {
+            self.selection = sel;
+            return Vec::new();
+        };
+        let snap = l.cel.composite_masked(rect, src, opacity, blend, sel.as_ref());
+        self.selection = sel;
         self.record(layer, "ストローク", snap)
     }
 
@@ -616,6 +787,52 @@ mod tests {
         let before = doc.flatten_rgba8(r_all);
         doc.merge_down(shade).unwrap();
         assert_eq!(doc.flatten_rgba8(r_all), before);
+    }
+
+    #[test]
+    fn selection_limits_strokes_and_fill_and_delete() {
+        let mut doc = Document::new(64, 64, 1 << 20);
+        let a = doc.add_layer(PixelFormat::Rgba8, "a");
+        // 左半分だけ選ぶ
+        doc.select_rect(Rect::new(0, 0, 32, 64), SelectMode::Replace);
+        assert!(doc.has_selection());
+        assert_eq!(doc.selection_bounds(), Rect::new(0, 0, 32, 64));
+        let r = Rect::new(0, 0, 64, 1);
+        doc.composite_stroke(a, r, &solid(r, [0, 0, 0, 255]), 1.0, Blend::Normal);
+        let px = doc.layer(a).unwrap().cel.read_rect(r);
+        assert_eq!(px[3], 255, "選択の中は描ける");
+        assert_eq!(px[40 * 4 + 3], 0, "選択の外は描けない");
+        // 足す・引く・反転
+        doc.select_rect(Rect::new(32, 0, 32, 32), SelectMode::Add);
+        assert_eq!(doc.selection_bounds().w, 64);
+        doc.select_rect(Rect::new(0, 0, 64, 32), SelectMode::Subtract);
+        assert_eq!(doc.selection_bounds(), Rect::new(0, 32, 32, 32));
+        doc.select_invert();
+        assert_eq!(doc.selection_bounds(), Rect::new(0, 0, 64, 64));
+        doc.select_none();
+        assert!(!doc.has_selection());
+        // 自動選択: 黒い線の上を選ぶと線だけ、透明を選ぶと残り全部
+        doc.select_wand(Some(a), 5, 0, 0, true, SelectMode::Replace);
+        assert_eq!(doc.selection_bounds(), Rect::new(0, 0, 32, 1));
+        doc.select_wand(Some(a), 40, 40, 0, true, SelectMode::Replace);
+        assert_eq!(doc.selection_bounds(), Rect::new(0, 0, 64, 64));
+        // 塗りつぶし: 透明の所に赤。線は残る
+        doc.select_none();
+        let changed = doc.fill(a, Some(a), 40, 40, [255, 0, 0, 255], 0, true);
+        assert!(!changed.is_empty());
+        let px = doc.layer(a).unwrap().cel.read_rect(Rect::new(0, 0, 64, 2));
+        assert_eq!(&px[0..4], &[0, 0, 0, 255], "線はそのまま");
+        assert_eq!(&px[64 * 4..64 * 4 + 4], &[255, 0, 0, 255], "2 行目は赤");
+        // 戻せる
+        doc.undo();
+        assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(0, 1, 1, 1))[3], 0);
+        // 選択範囲を塗る、消す
+        doc.select_rect(Rect::new(10, 10, 4, 4), SelectMode::Replace);
+        doc.fill_selection(a, [0, 255, 0, 255]);
+        assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(12, 12, 1, 1)), vec![0, 255, 0, 255]);
+        doc.delete_selection(a);
+        assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(12, 12, 1, 1))[3], 0);
+        assert_eq!(doc.layer(a).unwrap().cel.read_rect(Rect::new(0, 0, 1, 1))[3], 255, "選択の外は残る");
     }
 
     #[test]

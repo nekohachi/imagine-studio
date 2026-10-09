@@ -14,10 +14,12 @@ pub mod cel;
 pub mod document;
 pub mod history;
 pub mod io;
+pub mod selection;
 pub mod tile;
 
 pub use blend::{composite_pixel, BlendMode};
 pub use cel::{Blend, Cel};
 pub use document::{Document, Layer, LayerId};
 pub use history::{Entry, History};
+pub use selection::{region_by_color, Mask, SelectMode};
 pub use tile::{PixelFormat, Rect, Tile, TileKey, TILE};

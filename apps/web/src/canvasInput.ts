@@ -29,6 +29,8 @@ export interface CanvasInputHooks {
   onEyedrop: (docX: number, docY: number) => void;
   /** 描き始めにパネルを閉じる。閉じたなら真(そのタップは描かない) */
   closePanels: () => boolean;
+  /** 選択の矩形や投げ縄を仮表示する SVG(画面座標、CSS px) */
+  overlay: SVGSVGElement;
 }
 
 export interface InputStats {
@@ -64,6 +66,8 @@ export class CanvasInput {
   /** SHF の直線: 始点(doc) */
   private line: { x: number; y: number; pressure: number } | null = null;
   private lineEnd: { x: number; y: number } | null = null;
+  /** 選択のドラッグ(矩形 / 投げ縄)。点は doc 座標 */
+  private selecting: { kind: "rect" | "lasso"; pts: number[]; screen: number[]; id: number } | null = null;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -166,6 +170,56 @@ export class CanvasInput {
     this.bridge.send({ type: "cancel" });
   }
 
+  /** 選択のドラッグ中の仮表示(画面座標)。 */
+  private drawOverlay(): void {
+    const ov = this.hooks.overlay;
+    const s = this.selecting;
+    if (!s) {
+      ov.innerHTML = "";
+      return;
+    }
+    const pts = s.screen;
+    if (s.kind === "rect") {
+      const x0 = Math.min(pts[0]!, pts[pts.length - 2]!);
+      const y0 = Math.min(pts[1]!, pts[pts.length - 1]!);
+      const x1 = Math.max(pts[0]!, pts[pts.length - 2]!);
+      const y1 = Math.max(pts[1]!, pts[pts.length - 1]!);
+      ov.innerHTML = `<rect x="${x0}" y="${y0}" width="${x1 - x0}" height="${y1 - y0}"/>`;
+    } else {
+      const d = [];
+      for (let i = 0; i + 1 < pts.length; i += 2) d.push(`${i === 0 ? "M" : "L"}${pts[i]},${pts[i + 1]}`);
+      ov.innerHTML = `<path d="${d.join(" ")} Z"/>`;
+    }
+  }
+
+  private finishSelecting(cancel: boolean): void {
+    const s = this.selecting;
+    if (!s) return;
+    this.selecting = null;
+    this.drawOverlay();
+    if (cancel) return;
+    const mode = this.mods.on("shift") ? 1 : this.mods.on("ctrl") ? 2 : 0;
+    const p = s.pts;
+    if (s.kind === "rect") {
+      const x0 = Math.min(p[0]!, p[p.length - 2]!);
+      const y0 = Math.min(p[1]!, p[p.length - 1]!);
+      const x1 = Math.max(p[0]!, p[p.length - 2]!);
+      const y1 = Math.max(p[1]!, p[p.length - 1]!);
+      if (x1 - x0 < 1 || y1 - y0 < 1) {
+        // 動かさずに離した: 選択解除
+        this.bridge.send({ type: "select", kind: "none" });
+        return;
+      }
+      this.bridge.send({ type: "select", kind: "rect", x: x0, y: y0, w: x1 - x0, h: y1 - y0, mode });
+    } else {
+      if (p.length < 6) {
+        this.bridge.send({ type: "select", kind: "none" });
+        return;
+      }
+      this.bridge.send({ type: "select", kind: "polygon", points: Float32Array.from(p), mode });
+    }
+  }
+
   private fireRing(x: number, y: number): void {
     this.cancelStroke();
     const { menu, list } = this.hooks.onRing(x, y);
@@ -224,6 +278,48 @@ export class CanvasInput {
         return;
       }
 
+      // 塗りつぶし: タップで塗る
+      if (this.state.tool === "fill") {
+        const [x, y] = this.toDoc(e);
+        this.bridge.send({
+          type: "fill",
+          x,
+          y,
+          tolerance: this.state.tolerance,
+          contiguous: this.state.contiguous,
+          merged: this.state.sampleMerged,
+        });
+        return;
+      }
+
+      // 選択: SHF で足す、ALT(スポイトと兼用なので CTL)で引く
+      if (this.state.tool === "select") {
+        const mode = this.mods.on("shift") ? 1 : this.mods.on("ctrl") ? 2 : 0;
+        const [x, y] = this.toDoc(e);
+        if (this.state.selectTool === "wand") {
+          this.bridge.send({
+            type: "select",
+            kind: "wand",
+            x,
+            y,
+            tolerance: this.state.tolerance,
+            contiguous: this.state.contiguous,
+            merged: this.state.sampleMerged,
+            mode,
+          });
+          return;
+        }
+        this.selecting = {
+          kind: this.state.selectTool === "lasso" ? "lasso" : "rect",
+          pts: [x, y],
+          screen: [e.clientX, e.clientY],
+          id: e.pointerId,
+        };
+        c.setPointerCapture(e.pointerId);
+        this.drawOverlay();
+        return;
+      }
+
       this.activeId = e.pointerId;
       this.activeType = e.pointerType;
       this.stats.pointerType = e.pointerType;
@@ -272,6 +368,18 @@ export class CanvasInput {
     }
 
     c.addEventListener("pointermove", (e) => {
+      if (this.selecting && e.pointerId === this.selecting.id) {
+        const [x, y] = this.toDoc(e);
+        if (this.selecting.kind === "rect") {
+          this.selecting.pts = [this.selecting.pts[0]!, this.selecting.pts[1]!, x, y];
+          this.selecting.screen = [this.selecting.screen[0]!, this.selecting.screen[1]!, e.clientX, e.clientY];
+        } else {
+          this.selecting.pts.push(x, y);
+          this.selecting.screen.push(e.clientX, e.clientY);
+        }
+        this.drawOverlay();
+        return;
+      }
       if (e.pointerType === "touch") {
         this.taps.move(e.pointerId, e.clientX, e.clientY);
         if (this.touches.has(e.pointerId)) {
@@ -310,6 +418,21 @@ export class CanvasInput {
 
     const finish = (e: PointerEvent, cancel: boolean) => {
       this.longPress.end(e.pointerId);
+      if (this.selecting && e.pointerId === this.selecting.id) {
+        if (!cancel) {
+          const [x, y] = this.toDoc(e);
+          if (this.selecting.kind === "rect") {
+            this.selecting.pts = [this.selecting.pts[0]!, this.selecting.pts[1]!, x, y];
+          } else this.selecting.pts.push(x, y);
+        }
+        this.finishSelecting(cancel);
+        try {
+          c.releasePointerCapture(e.pointerId);
+        } catch {
+          /* 既に外れている */
+        }
+        return;
+      }
       if (e.pointerType === "touch") {
         this.touches.delete(e.pointerId);
         this.taps.up(e.pointerId, e.timeStamp, cancel);

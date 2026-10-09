@@ -87,10 +87,62 @@ impl Cel {
     /// `opacity` を掛けて焼き込む。1 ストロークに 1 回だけ呼ぶ(同一ストローク内で濃くならない)。
     /// 戻り値は触ったタイルの変更前(Undo 用)。
     pub fn composite(&mut self, rect: Rect, src: &[u8], opacity: f32, blend: Blend) -> Snapshot {
+        self.composite_masked(rect, src, opacity, blend, None)
+    }
+
+    /// `mask`(A8 の全面 Cel。選択範囲)があれば、その値で src のアルファを絞ってから焼く。
+    pub fn composite_masked(
+        &mut self,
+        rect: Rect,
+        src: &[u8],
+        opacity: f32,
+        blend: Blend,
+        mask: Option<&Cel>,
+    ) -> Snapshot {
+        let full = rect;
         let rect = rect.intersect(&self.bounds());
         if rect.is_empty() {
             return Vec::new();
         }
+        let masked: Vec<u8>;
+        let src: &[u8] = if let Some(m) = mask {
+            // 元の矩形(full)の並びから、はみ出しを除いた rect の並びに詰め直しつつマスクを掛ける
+            let mv = m.read_rect(rect);
+            let full_stride = full.w as usize * 4;
+            let mut v = vec![0u8; rect.w as usize * rect.h as usize * 4];
+            for y in 0..rect.h as usize {
+                let sy = y + (rect.y - full.y) as usize;
+                let sx = (rect.x - full.x) as usize;
+                let srow = &src[sy * full_stride + sx * 4..sy * full_stride + (sx + rect.w as usize) * 4];
+                let drow = &mut v[y * rect.w as usize * 4..(y + 1) * rect.w as usize * 4];
+                let mrow = &mv[y * rect.w as usize..(y + 1) * rect.w as usize];
+                for ((d, s), &k) in drow.chunks_exact_mut(4).zip(srow.chunks_exact(4)).zip(mrow) {
+                    if k == 255 {
+                        d.copy_from_slice(s);
+                    } else if k > 0 {
+                        for c in 0..4 {
+                            d[c] = ((s[c] as u32 * k as u32 + 127) / 255) as u8;
+                        }
+                    }
+                }
+            }
+            masked = v;
+            &masked
+        } else if rect == full {
+            src
+        } else {
+            // はみ出した分を除いて詰め直す
+            let full_stride = full.w as usize * 4;
+            let mut v = vec![0u8; rect.w as usize * rect.h as usize * 4];
+            for y in 0..rect.h as usize {
+                let sy = y + (rect.y - full.y) as usize;
+                let sx = (rect.x - full.x) as usize;
+                v[y * rect.w as usize * 4..(y + 1) * rect.w as usize * 4]
+                    .copy_from_slice(&src[sy * full_stride + sx * 4..sy * full_stride + (sx + rect.w as usize) * 4]);
+            }
+            masked = v;
+            &masked
+        };
         let src_stride = (rect.w as usize) * 4;
         debug_assert!(src.len() >= src_stride * rect.h as usize);
         let opq = (opacity.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;

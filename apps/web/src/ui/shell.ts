@@ -2,7 +2,7 @@
 // 中身(パネルの内容)は panels.ts。ここは置き場所と開閉だけ。
 import { svgIcon, type IconName } from "./icons";
 
-export type PanelName = "gallery" | "actions" | "adjust" | "select" | "transform" | "brush" | "layers" | "color";
+export type PanelName = "gallery" | "actions" | "adjust" | "select" | "transform" | "brush" | "layers" | "color" | "fill";
 
 export interface Shell {
   top: HTMLElement;

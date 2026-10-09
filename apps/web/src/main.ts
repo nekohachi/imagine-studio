@@ -13,8 +13,10 @@ import {
   renderActionsPanel,
   renderBrushPanel,
   renderColorPanel,
+  renderFillPanel,
   renderLaterPanel,
   renderLayersPanel,
+  renderSelectPanel,
   setThumbnails,
   viewMenu,
   type Ctx,
@@ -163,8 +165,19 @@ const ctx: Ctx = {
       shell.toast("次にタップした所の色を拾います");
     },
     thumbnails: () => requestThumbnails(),
+    setTool: (tool) => {
+      if (state.tool === tool) return;
+      state.tool = tool;
+      state.emit("tool");
+    },
   },
 };
+state.on("tool", () => {
+  shell.buttons.select!.classList.toggle("on", state.tool === "select");
+  shell.buttons.brush!.classList.toggle("on", state.tool === "brush" && !state.brush.eraser);
+  shell.buttons.eraser!.classList.toggle("on", state.tool === "brush" && Boolean(state.brush.eraser));
+  if (state.tool === "fill") shell.toast("塗りつぶし: キャンバスをタップ");
+});
 
 let eyedropId = 0;
 const input = new CanvasInput(canvas, state, bridge, mods, {
@@ -187,9 +200,13 @@ const input = new CanvasInput(canvas, state, bridge, mods, {
   },
   closePanels: () => {
     if (!shell.panelOpen()) return false;
+    // 選択と塗りのパネルは開いたまま使う(タップが操作なので)
+    const open = shell.panelOpen();
+    if (open === "select" || open === "fill") return false;
     shell.closePanel();
     return true;
   },
+  overlay: document.getElementById("overlay") as unknown as SVGSVGElement,
 });
 
 // ---- 上バー ----
@@ -197,14 +214,19 @@ const panels: Record<string, () => void> = {
   gallery: () => shell.openPanel("gallery", (b) => renderActionsPanel(b, ctx)),
   actions: () => shell.openPanel("actions", (b) => renderActionsPanel(b, ctx)),
   adjust: () => shell.openPanel("adjust", (b) => renderLaterPanel(b, "調整")),
-  select: () => shell.openPanel("select", (b) => renderLaterPanel(b, "選択")),
+  select: () => shell.openPanel("select", (b) => renderSelectPanel(b, ctx)),
   transform: () => shell.openPanel("transform", (b) => renderLaterPanel(b, "変形")),
-  brush: () => shell.openPanel("brush", (b) => renderBrushPanel(b, ctx)),
+  fill: () => shell.openPanel("fill", (b) => renderFillPanel(b, ctx)),
+  brush: () => {
+    ctx.act.setTool("brush");
+    shell.openPanel("brush", (b) => renderBrushPanel(b, ctx));
+  },
   layers: () => shell.openPanel("layers", (b) => renderLayersPanel(b, ctx)),
   color: () => shell.openPanel("color", (b) => renderColorPanel(b, ctx)),
 };
 for (const [id, fn] of Object.entries(panels)) {
-  const b = shell.buttons[id]!;
+  const b = shell.buttons[id];
+  if (!b) continue;
   if (id === "brush") {
     // タップで一覧、長押しでお気に入りの輪(docs/04)
     attachRadialButton(b, () => brushRing(), fn, () => canvasMenuList(ctx));
@@ -213,7 +235,10 @@ for (const [id, fn] of Object.entries(panels)) {
   }
 }
 shell.buttons.smudge!.addEventListener("click", () => shell.toast("指先はフェーズ 4 で入ります"));
-shell.buttons.eraser!.addEventListener("click", toggleEraser);
+shell.buttons.eraser!.addEventListener("click", () => {
+  ctx.act.setTool("brush");
+  toggleEraser();
+});
 shell.buttons.undo!.addEventListener("click", ctx.act.undo);
 shell.buttons.redo!.addEventListener("click", ctx.act.redo);
 
@@ -272,13 +297,16 @@ attachRadialButton(
   delBtn,
   () => ({
     N: { label: "レイヤーを消去", icon: ICONS.clear, run: () => bridge.send({ type: "clear" }) },
+    E: { label: "選択範囲を消去", icon: ICONS.select, run: () => bridge.send({ type: "deleteSelection" }) },
+    W: { label: "選択を解除", icon: ICONS.select, run: () => bridge.send({ type: "select", kind: "none" }) },
     S: {
       label: "レイヤーを削除",
       icon: ICONS.trash,
       run: () => bridge.send({ type: "layerOp", op: "remove", id: state.active }),
     },
   }),
-  () => bridge.send({ type: "clear" })
+  // タップ: 選択範囲があればその中だけ、無ければレイヤー全体を消す
+  () => bridge.send(state.hasSelection ? { type: "deleteSelection" } : { type: "clear" })
 );
 
 // ---- 色見本 ----
@@ -343,6 +371,8 @@ bridge.on("stats", (m) => {
   }
   shell.buttons.undo!.disabled = !m.stats.canUndo;
   shell.buttons.redo!.disabled = !m.stats.canRedo;
+  state.hasSelection = m.stats.hasSelection;
+  shell.buttons.select!.classList.toggle("open", state.hasSelection && shell.panelOpen() !== "select");
   renderHud();
   if (shell.panelOpen() === "layers" && m.stats.bakeMs > 0) requestThumbnails();
 });
@@ -387,8 +417,24 @@ window.addEventListener("keydown", (e) => {
   } else if ((e.ctrlKey || e.metaKey) && k === "y") {
     e.preventDefault();
     ctx.act.redo();
-  } else if (k === "b" && !state.brush.eraser) {
-    panels.brush!();
+  } else if ((e.ctrlKey || e.metaKey) && k === "d") {
+    e.preventDefault();
+    bridge.send({ type: "select", kind: "none" });
+  } else if ((e.ctrlKey || e.metaKey) && k === "a") {
+    e.preventDefault();
+    bridge.send({ type: "select", kind: "all" });
+  } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && k === "i") {
+    e.preventDefault();
+    bridge.send({ type: "select", kind: "invert" });
+  } else if (k === "delete" || k === "backspace") {
+    bridge.send(state.hasSelection ? { type: "deleteSelection" } : { type: "clear" });
+  } else if (k === "m") {
+    panels.select!();
+  } else if (k === "g") {
+    panels.fill!();
+  } else if (k === "b") {
+    ctx.act.setTool("brush");
+    if (state.brush.eraser) toggleEraser();
   } else if (k === "e") {
     toggleEraser();
   } else if (k === "x") {

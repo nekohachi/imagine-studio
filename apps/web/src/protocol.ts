@@ -83,6 +83,13 @@ export type ToWorker =
   | { type: "setLayerClip"; id: number; clip: boolean }
   | { type: "thumbnails"; size: number }
   | { type: "sample"; id: number; x: number; y: number }
+  | { type: "select"; kind: "rect"; x: number; y: number; w: number; h: number; mode: number }
+  | { type: "select"; kind: "polygon"; points: Float32Array; mode: number }
+  | { type: "select"; kind: "wand"; x: number; y: number; tolerance: number; contiguous: boolean; merged: boolean; mode: number }
+  | { type: "select"; kind: "all" | "none" | "invert" }
+  | { type: "fill"; x: number; y: number; tolerance: number; contiguous: boolean; merged: boolean }
+  | { type: "fillSelection" }
+  | { type: "deleteSelection" }
   | { type: "line"; x0: number; y0: number; x1: number; y1: number; pressure: number; commit: boolean }
   | { type: "clear" }
   | { type: "undo" }
@@ -112,6 +119,7 @@ export interface Stats {
   tiles: number;
   canUndo: boolean;
   canRedo: boolean;
+  hasSelection: boolean;
 }
 
 export type FromWorker =

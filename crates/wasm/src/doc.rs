@@ -4,7 +4,7 @@
 //! 眺めは wasm メモリが伸びると無効になるので、受け取ったらすぐ texSubImage2D に渡し、
 //! 持ち越さないこと。
 
-use canvas_core::{Blend, BlendMode, Document, PixelFormat, Rect, TileKey};
+use canvas_core::{Blend, BlendMode, Document, PixelFormat, Rect, SelectMode, TileKey};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -189,6 +189,74 @@ impl Doc {
             self.inner.sample_over_white(n - 1, x, y)
         };
         js_sys::Float32Array::from(&c[..])
+    }
+
+    // ---- 選択範囲 ----
+
+    pub fn has_selection(&self) -> bool {
+        self.inner.has_selection()
+    }
+    pub fn select_none(&mut self) {
+        self.inner.select_none();
+    }
+    pub fn select_all(&mut self) {
+        self.inner.select_all();
+    }
+    pub fn select_invert(&mut self) {
+        self.inner.select_invert();
+    }
+    /// mode: 0 置換、1 足す、2 引く
+    pub fn select_rect(&mut self, x: i32, y: i32, w: i32, h: i32, mode: u32) {
+        self.inner.select_rect(Rect::new(x, y, w, h), SelectMode::from_index(mode));
+    }
+    /// 点は [x, y, x, y, ...]
+    pub fn select_polygon(&mut self, points: &[f32], mode: u32) {
+        let pts: Vec<(f32, f32)> = points.chunks_exact(2).map(|p| (p[0], p[1])).collect();
+        self.inner.select_polygon(&pts, SelectMode::from_index(mode));
+    }
+    /// layer が 0 なら見えている絵で判定。
+    pub fn select_wand(&mut self, layer: u32, x: i32, y: i32, tolerance: u8, contiguous: bool, mode: u32) {
+        let l = if layer == 0 { None } else { Some(layer) };
+        self.inner
+            .select_wand(l, x, y, tolerance, contiguous, SelectMode::from_index(mode));
+    }
+    /// 選択範囲の A8(全面)。無ければ長さ 0。
+    pub fn selection_mask(&self) -> js_sys::Uint8Array {
+        match self.inner.selection() {
+            Some(c) => js_sys::Uint8Array::from(c.read_rect(c.bounds()).as_slice()),
+            None => js_sys::Uint8Array::new_with_length(0),
+        }
+    }
+    /// [x, y, w, h]
+    pub fn selection_bounds(&self) -> js_sys::Int32Array {
+        let b = self.inner.selection_bounds();
+        js_sys::Int32Array::from(&[b.x, b.y, b.w, b.h][..])
+    }
+
+    // ---- 塗りつぶし ----
+
+    /// バケツ。reference が 0 なら見えている絵で領域を決める。色は 0..255 のストレート RGB。
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill(
+        &mut self,
+        layer: u32,
+        reference: u32,
+        x: i32,
+        y: i32,
+        r: u8,
+        g: u8,
+        b: u8,
+        tolerance: u8,
+        contiguous: bool,
+    ) -> js_sys::Int32Array {
+        let rf = if reference == 0 { None } else { Some(reference) };
+        keys_to_array(&self.inner.fill(layer, rf, x, y, [r, g, b, 255], tolerance, contiguous))
+    }
+    pub fn fill_selection(&mut self, layer: u32, r: u8, g: u8, b: u8) -> js_sys::Int32Array {
+        keys_to_array(&self.inner.fill_selection(layer, [r, g, b, 255]))
+    }
+    pub fn delete_selection(&mut self, layer: u32) -> js_sys::Int32Array {
+        keys_to_array(&self.inner.delete_selection(layer))
     }
 
     /// GPU で描いたストロークバッファの矩形(プリマルチ RGBA8)を焼く。戻り値は変わったタイル [tx, ty, ...]。

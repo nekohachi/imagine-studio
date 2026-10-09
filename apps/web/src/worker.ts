@@ -96,7 +96,19 @@ function stats(frameStart: number, dabs: number, lastInputTime: number): Stats {
     tiles: doc ? doc.tile_count() : 0,
     canUndo: doc ? doc.can_undo() : false,
     canRedo: doc ? doc.can_redo() : false,
+    hasSelection: doc ? doc.has_selection() : false,
   };
+}
+
+/** 選択範囲を GPU に反映する。 */
+function syncSelection(): void {
+  if (!renderer || !doc) return;
+  renderer.uploadSelection(doc.has_selection() ? doc.selection_mask() : null);
+}
+
+/** 色(0..1)を 0..255 に。 */
+function rgb255(): [number, number, number] {
+  return [Math.round(colorRgb[0] * 255), Math.round(colorRgb[1] * 255), Math.round(colorRgb[2] * 255)];
 }
 
 /** 編集中レイヤーのタイルを全部 GPU へ。 */
@@ -186,6 +198,7 @@ function mountDoc(next: Doc): void {
   renderer?.setDocSize(doc.width, doc.height, doc.layer_format(active) === 1);
   uploadActiveAll();
   rebuildMerged();
+  syncSelection();
   present();
 }
 
@@ -480,6 +493,62 @@ async function handle(m: ToWorker): Promise<void> {
       present();
       scheduleAutosave();
       post({ type: "layers", layers: layerInfos(), active });
+      return;
+    }
+    case "select": {
+      if (!doc) return;
+      switch (m.kind) {
+        case "rect":
+          doc.select_rect(Math.round(m.x), Math.round(m.y), Math.round(m.w), Math.round(m.h), m.mode);
+          break;
+        case "polygon":
+          doc.select_polygon(m.points, m.mode);
+          break;
+        case "wand":
+          doc.select_wand(m.merged ? 0 : active, Math.round(m.x), Math.round(m.y), m.tolerance, m.contiguous, m.mode);
+          break;
+        case "all":
+          doc.select_all();
+          break;
+        case "none":
+          doc.select_none();
+          break;
+        case "invert":
+          doc.select_invert();
+          break;
+      }
+      syncSelection();
+      present();
+      post({ type: "stats", stats: stats(performance.now(), 0, 0) });
+      return;
+    }
+    case "fill": {
+      if (!doc) return;
+      const t0 = performance.now();
+      const [r, g, b] = rgb255();
+      const changed = doc.fill(active, m.merged ? 0 : active, Math.round(m.x), Math.round(m.y), r, g, b, m.tolerance, m.contiguous);
+      uploadActiveTiles(changed);
+      lastBakeMs = performance.now() - t0;
+      present();
+      scheduleAutosave();
+      post({ type: "stats", stats: stats(t0, 0, 0) });
+      return;
+    }
+    case "fillSelection": {
+      if (!doc) return;
+      const [r, g, b] = rgb255();
+      uploadActiveTiles(doc.fill_selection(active, r, g, b));
+      present();
+      scheduleAutosave();
+      post({ type: "stats", stats: stats(performance.now(), 0, 0) });
+      return;
+    }
+    case "deleteSelection": {
+      if (!doc) return;
+      uploadActiveTiles(doc.delete_selection(active));
+      present();
+      scheduleAutosave();
+      post({ type: "stats", stats: stats(performance.now(), 0, 0) });
       return;
     }
     case "setLayerBlend": {
