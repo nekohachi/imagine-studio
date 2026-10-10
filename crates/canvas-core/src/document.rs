@@ -7,6 +7,7 @@ use crate::cel::{Blend, Cel, Snapshot};
 use crate::history::{Entry, History, Splice};
 use crate::selection::{region_by_color, Mask, SelectMode};
 use crate::tile::{PixelFormat, Rect, TileKey};
+use crate::tone::Tone;
 use crate::transform::{resample, Affine, Floating};
 use crate::vector::{DabBuf, EraseMode, VStroke};
 
@@ -33,6 +34,8 @@ pub struct Layer {
     pub cel: Cel,
     /// ベクターレイヤーなら線の列(cel はその描画キャッシュ)
     pub vector: Option<Vec<VStroke>>,
+    /// トーン(A8 レイヤーに非破壊で乗せる網点化)
+    pub tone: Option<Tone>,
 }
 
 impl Layer {
@@ -46,6 +49,7 @@ impl Layer {
             clip: false,
             cel: Cel::new(format, width, height),
             vector: None,
+            tone: None,
         }
     }
 
@@ -53,16 +57,17 @@ impl Layer {
         self.vector.is_some()
     }
 
-    /// プリマルチ RGBA8 で矩形を読む(A8 は黒インク)。
-    fn read_rgba(&self, rect: Rect) -> Vec<u8> {
+    /// プリマルチ RGBA8 で矩形を読む(A8 は黒インク。トーンがあれば網点化して)。
+    pub fn read_rgba(&self, rect: Rect) -> Vec<u8> {
         match self.cel.format() {
             PixelFormat::Rgba8 => self.cel.read_rect(rect),
-            PixelFormat::A8 => self
-                .cel
-                .read_rect(rect)
-                .into_iter()
-                .flat_map(|a| [0, 0, 0, a])
-                .collect(),
+            PixelFormat::A8 => {
+                let mut a = self.cel.read_rect(rect);
+                if let Some(t) = &self.tone {
+                    t.apply(&mut a, rect);
+                }
+                a.into_iter().flat_map(|a| [0, 0, 0, a]).collect()
+            }
         }
     }
 }
@@ -413,6 +418,30 @@ impl Document {
         self.fill_mask(layer, &region, color)
     }
 
+    /// 囲って塗る(docs/06 のベタ): 多角形の中で、参照(見えている絵)に絵の具が無い所を塗る。
+    /// `threshold` はアルファの閾値(これ以下を「無い」とみなす)。選択範囲があればその中だけ。
+    pub fn fill_enclosed(
+        &mut self,
+        layer: LayerId,
+        reference: Option<LayerId>,
+        pts: &[(f32, f32)],
+        threshold: u8,
+        color: [u8; 4],
+    ) -> Vec<TileKey> {
+        let mut m = Mask::new(self.width, self.height);
+        m.fill_polygon(pts, 255);
+        if m.is_empty() {
+            return Vec::new();
+        }
+        let px = self.reference_pixels(reference);
+        for (d, p) in m.data.iter_mut().zip(px.chunks_exact(4)) {
+            if p[3] > threshold {
+                *d = 0;
+            }
+        }
+        self.fill_mask(layer, &m, color)
+    }
+
     /// 選択範囲(無ければ全面)を 1 色で塗る。
     pub fn fill_selection(&mut self, layer: LayerId, color: [u8; 4]) -> Vec<TileKey> {
         let m = match &self.selection {
@@ -588,6 +617,7 @@ impl Document {
             clip: src.clip,
             cel,
             vector: src.vector.clone(),
+            tone: src.tone.clone(),
         };
         self.layers.insert(i + 1, layer);
         Some(new_id)

@@ -115,6 +115,36 @@ impl Doc {
         self.inner.layer(id).is_some_and(|l| l.is_vector())
     }
 
+    /// トーンの JSON(無ければ空文字)。
+    pub fn layer_tone(&self, id: u32) -> String {
+        self.inner
+            .layer(id)
+            .and_then(|l| l.tone.as_ref())
+            .map_or(String::new(), |t| serde_json::to_string(t).unwrap_or_default())
+    }
+
+    /// トーンを付ける(空文字で外す)。A8 レイヤーだけ。
+    pub fn set_layer_tone(&mut self, id: u32, json: &str) -> Result<(), JsError> {
+        let tone = if json.is_empty() {
+            None
+        } else {
+            Some(canvas_core::Tone::from_json(json).map_err(|e| JsError::new(&e))?.sanitized())
+        };
+        if let Some(l) = self.inner.layer_mut(id) {
+            if l.cel.format() == PixelFormat::A8 {
+                l.tone = tone;
+            }
+        }
+        Ok(())
+    }
+
+    /// 囲って塗る: 多角形の中で、参照に絵の具が無い所(アルファが threshold 以下)を塗る。
+    pub fn fill_enclosed(&mut self, layer: u32, reference: u32, points: &[f32], threshold: u8, r: u8, g: u8, b: u8) -> js_sys::Int32Array {
+        let pts: Vec<(f32, f32)> = points.chunks_exact(2).map(|p| (p[0], p[1])).collect();
+        let reference = if reference == 0 { None } else { Some(reference) };
+        keys_to_array(&self.inner.fill_enclosed(layer, reference, &pts, threshold, [r, g, b, 255]))
+    }
+
     pub fn rasterize_layer(&mut self, id: u32) -> bool {
         self.inner.rasterize_layer(id)
     }

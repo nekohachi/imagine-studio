@@ -17,6 +17,7 @@ pub mod history;
 pub mod io;
 pub mod selection;
 pub mod tile;
+pub mod tone;
 pub mod transform;
 pub mod vector;
 
@@ -29,3 +30,4 @@ pub use history::{Entry, History};
 pub use selection::{region_by_color, Mask, SelectMode};
 pub use transform::{resample, Affine, Floating};
 pub use tile::{PixelFormat, Rect, Tile, TileKey, TILE};
+pub use tone::Tone;

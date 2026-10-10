@@ -12,6 +12,7 @@ import {
   POINT_STRIDE,
   type BrushPreset,
   type FromWorker,
+  type ToneParams,
   type LayerInfo,
   type Stats,
   type ToWorker,
@@ -111,7 +112,17 @@ function layerInfos(): LayerInfo[] {
     blend: doc!.layer_blend(id),
     clip: doc!.layer_clip(id),
     vector: doc!.layer_vector(id),
+    tone: parseTone(doc!.layer_tone(id)),
   }));
+}
+
+function parseTone(json: string): ToneParams | null {
+  if (!json) return null;
+  try {
+    return JSON.parse(json) as ToneParams;
+  } catch {
+    return null;
+  }
 }
 
 function stats(frameStart: number, dabs: number, lastInputTime: number): Stats {
@@ -184,6 +195,7 @@ function present(showStroke = false, showPredict = false): void {
   const vis = doc ? doc.layer_visible(active) : true;
   const mode = doc ? doc.layer_blend(active) : 0;
   const clip = doc ? doc.layer_clip(active) && doc.clip_base(active) !== 0 : false;
+  renderer?.setTone(doc && doc.layer_format(active) === 1 ? parseTone(doc.layer_tone(active)) : null);
   renderer?.present(view, brushOpacity(), showStroke, showPredict, op, vis, mode, clip, floatM);
 }
 
@@ -615,6 +627,26 @@ async function handle(m: ToWorker): Promise<void> {
       present();
       scheduleAutosave();
       post({ type: "stats", stats: stats(t0, 0, 0) });
+      return;
+    }
+    case "fillEnclosed": {
+      if (!doc || refuseOnVector("囲って塗る")) return;
+      const t0 = performance.now();
+      const [r, g, b] = rgb255();
+      uploadActiveTiles(doc.fill_enclosed(active, m.merged ? 0 : active, m.points, m.threshold, r, g, b));
+      lastBakeMs = performance.now() - t0;
+      present();
+      scheduleAutosave();
+      post({ type: "stats", stats: stats(t0, 0, 0) });
+      return;
+    }
+    case "setLayerTone": {
+      if (!doc) return;
+      doc.set_layer_tone(m.id, m.tone ? JSON.stringify(m.tone) : "");
+      if (m.id !== active) rebuildMerged();
+      present();
+      scheduleAutosave();
+      post({ type: "layers", layers: layerInfos(), active });
       return;
     }
     case "fillSelection": {

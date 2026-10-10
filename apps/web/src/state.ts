@@ -83,6 +83,8 @@ export class AppState {
   /** 変形中: 持ち上げた矩形(doc)と、今の行列 [a, b, c, d, e, f] */
   transform: { rect: [number, number, number, number]; m: [number, number, number, number, number, number] } | null = null;
   selectTool: "rect" | "lasso" | "wand" = "rect";
+  /** 塗り: タップで塗るか、囲って塗るか */
+  fillTool: "tap" | "enclose" = "tap";
   /** 自動選択と塗りの許容値 0..255 */
   tolerance = 32;
   contiguous = true;

@@ -73,7 +73,7 @@ export class CanvasInput {
   private line: { x: number; y: number; pressure: number } | null = null;
   private lineEnd: { x: number; y: number } | null = null;
   /** 選択のドラッグ(矩形 / 投げ縄)。点は doc 座標 */
-  private selecting: { kind: "rect" | "lasso"; pts: number[]; screen: number[]; id: number } | null = null;
+  private selecting: { kind: "rect" | "lasso"; pts: number[]; screen: number[]; id: number; fill?: boolean } | null = null;
   /** 変形のドラッグ: 移動、または隅をつまんだ拡縮(反対の隅を軸に) */
   private dragging: {
     id: number;
@@ -371,6 +371,17 @@ export class CanvasInput {
     if (cancel) return;
     const mode = this.mods.on("shift") ? 1 : this.mods.on("ctrl") ? 2 : 0;
     const p = s.pts;
+    if (s.fill) {
+      if (p.length >= 6) {
+        this.bridge.send({
+          type: "fillEnclosed",
+          points: Float32Array.from(p),
+          threshold: this.state.tolerance,
+          merged: this.state.sampleMerged,
+        });
+      }
+      return;
+    }
     if (s.kind === "rect") {
       const x0 = Math.min(p[0]!, p[p.length - 2]!);
       const y0 = Math.min(p[1]!, p[p.length - 1]!);
@@ -475,9 +486,15 @@ export class CanvasInput {
         return;
       }
 
-      // 塗りつぶし: タップで塗る
+      // 塗りつぶし: タップで塗る、または囲って塗る(投げ縄)
       if (this.state.tool === "fill") {
         const [x, y] = this.toDoc(e);
+        if (this.state.fillTool === "enclose") {
+          this.selecting = { kind: "lasso", pts: [x, y], screen: [e.clientX, e.clientY], id: e.pointerId, fill: true };
+          c.setPointerCapture(e.pointerId);
+          this.drawOverlay();
+          return;
+        }
         this.bridge.send({
           type: "fill",
           x,

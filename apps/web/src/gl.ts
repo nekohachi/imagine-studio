@@ -172,7 +172,39 @@ uniform sampler2D uSel;      // 選択範囲(あればその中だけ)
 uniform int uHasAdj;
 uniform int uAdjSel;
 uniform vec3 uHsl;           // 色相のずれ 0..1、彩度 -1..1、明度 -1..1
+// トーン(A8 の編集中レイヤーに網点化)。canvas-core の tone.rs と同じ式
+uniform int uToneOn;
+uniform vec4 uTone;          // 周期 px、角度(ラジアン)、濃度、形(0 円 1 線 2 ノイズ)
+uniform float uViewScale;    // 画面 px / doc px(縮小時は灰色に落とす)
+uniform vec2 uDocSize;       // doc px(頂点側と同じ値)
 out vec4 o;
+
+float thash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.547); }
+float toneCoverage(vec2 d) {
+  float p = uTone.x;
+  float s = sin(uTone.y);
+  float c = cos(uTone.y);
+  float u = (c * d.x + s * d.y) / p;
+  float v = (-s * d.x + c * d.y) / p;
+  float aa = 0.5 / p;
+  float den = uTone.z;
+  int shape = int(uTone.w + 0.5);
+  if (shape == 1) {
+    float fv = abs(v - floor(v + 0.5));
+    return 1.0 - smoothstep(den * 0.5 - aa, den * 0.5 + aa, fv);
+  }
+  if (shape == 2) {
+    return thash(vec2(floor(u * 4.0), floor(v * 4.0))) < den ? 1.0 : 0.0;
+  }
+  if (den <= 0.5) {
+    float r = sqrt(den / 3.14159265);
+    vec2 f = vec2(u - floor(u + 0.5), v - floor(v + 0.5));
+    return 1.0 - smoothstep(r - aa, r + aa, length(f));
+  }
+  float r = sqrt((1.0 - den) / 3.14159265);
+  vec2 f = vec2(u + 0.5 - floor(u + 1.0), v + 0.5 - floor(v + 1.0));
+  return smoothstep(r - aa, r + aa, length(f));
+}
 
 vec3 rgb2hsl(vec3 c) {
   float mx = max(c.r, max(c.g, c.b));
@@ -262,6 +294,11 @@ void main() {
   vec4 back = texture(uBack, vUv);
   if (vDocUv.x < 0.0 || vDocUv.y < 0.0 || vDocUv.x > 1.0 || vDocUv.y > 1.0) { o = back; return; }
   vec4 act = uActiveA8 == 1 ? vec4(0.0, 0.0, 0.0, texture(uActive, vDocUv).r) : texture(uActive, vDocUv);
+  if (uToneOn == 1 && act.a > 0.0) {
+    // 縮小して周期が 3 画面 px を切ったら、モアレを避けて濃度の灰色で見せる
+    float k = uTone.x * uViewScale < 3.0 ? uTone.z : toneCoverage(vDocUv * uDocSize);
+    act.a *= k;
+  }
   if (uShowStroke == 1) { vec4 s = texture(uStroke, vDocUv) * uStrokeOp; act = s + act * (1.0 - s.a); }
   if (uShowPredict == 1) { vec4 p = texture(uPredict, vDocUv) * uStrokeOp; act = p + act * (1.0 - p.a); }
   if (uHasClip == 1) act *= texture(uClip, vDocUv).r;
@@ -385,6 +422,8 @@ export class Renderer {
   private lutTex!: WebGLTexture;
   /** 色調補正の仮表示。null なら無し。hsl は [色相 0..1, 彩度 -1..1, 明度 -1..1] */
   private adj: { hsl: [number, number, number]; useHsl: boolean } | null = null;
+  /** 編集中レイヤーのトーン(無ければ null) */
+  private tone: { period: number; angle: number; density: number; shape: number } | null = null;
   private quadVbo!: WebGLBuffer;
   private unitVbo!: WebGLBuffer;
   private dabVbo!: WebGLBuffer;
@@ -464,6 +503,9 @@ export class Renderer {
       "uHasAdj",
       "uAdjSel",
       "uHsl",
+      "uToneOn",
+      "uTone",
+      "uViewScale",
     ]) {
       this.c[n] = gl.getUniformLocation(this.composeProg, n)!;
     }
@@ -582,6 +624,18 @@ export class Renderer {
 
   get hasSelection(): boolean {
     return this.sel !== null;
+  }
+
+  /** 編集中レイヤーのトーン。null で無し。 */
+  setTone(t: { lines: number; dpi: number; density: number; angle: number; shape: number } | null): void {
+    this.tone = t
+      ? {
+          period: Math.max(1, t.dpi / Math.max(1, t.lines)),
+          angle: (t.angle * Math.PI) / 180,
+          density: Math.min(1, Math.max(0, t.density)),
+          shape: t.shape | 0,
+        }
+      : null;
   }
 
   /** 色調補正の仮表示。lut は 256 要素、null で解除。 */
@@ -850,6 +904,9 @@ export class Renderer {
     gl.uniform1i(this.c.uHasAdj!, this.adj ? (this.adj.useHsl ? 2 : 1) : 0);
     gl.uniform1i(this.c.uAdjSel!, this.adj && this.sel ? 1 : 0);
     gl.uniform3f(this.c.uHsl!, this.adj?.hsl[0] ?? 0, this.adj?.hsl[1] ?? 0, this.adj?.hsl[2] ?? 0);
+    gl.uniform1i(this.c.uToneOn!, this.tone ? 1 : 0);
+    gl.uniform4f(this.c.uTone!, this.tone?.period ?? 10, this.tone?.angle ?? 0, this.tone?.density ?? 0.5, this.tone?.shape ?? 0);
+    gl.uniform1f(this.c.uViewScale!, view.scale);
     gl.uniform1i(this.c.uMode!, blendMode | 0);
     gl.uniform1f(this.c.uOpacity!, activeVisible ? activeOpacity : 0);
     gl.uniform1f(this.c.uStrokeOp!, strokeOpacity);

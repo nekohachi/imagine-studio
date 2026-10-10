@@ -47,6 +47,18 @@ export interface BrushPreset {
   json: string;
 }
 
+/** トーン(canvas-core の Tone と同じ形) */
+export interface ToneParams {
+  lines: number;
+  dpi: number;
+  density: number;
+  angle: number;
+  /** 0 円、1 線、2 ノイズ */
+  shape: number;
+}
+
+export const DEFAULT_TONE: ToneParams = { lines: 60, dpi: 600, density: 0.5, angle: 45, shape: 0 };
+
 export interface LayerInfo {
   id: number;
   name: string;
@@ -58,6 +70,8 @@ export interface LayerInfo {
   clip: boolean;
   /** ベクターレイヤー(線を持ち、消しゴムは線単位) */
   vector: boolean;
+  /** トーン(A8 レイヤーだけ)。無ければ null */
+  tone: ToneParams | null;
 }
 
 /** 色調補正のパラメータ(canvas-core の Adjust と同じ形。省いた項目は「変化なし」)。 */
@@ -127,6 +141,8 @@ export type ToWorker =
   | { type: "select"; kind: "all" | "none" | "invert" }
   | { type: "fill"; x: number; y: number; tolerance: number; contiguous: boolean; merged: boolean }
   | { type: "fillSelection" }
+  | { type: "fillEnclosed"; points: Float32Array; threshold: number; merged: boolean }
+  | { type: "setLayerTone"; id: number; tone: ToneParams | null }
   | { type: "deleteSelection" }
   | { type: "transformBegin" }
   | { type: "transformPreview"; m: number[] }

@@ -37,6 +37,9 @@ struct LayerJson {
     /// ベクターレイヤーなら真。線は pages/0/vectors/<id>.json
     #[serde(default)]
     vector: bool,
+    /// トーン(A8 レイヤーの網点化)。無ければ null
+    #[serde(default)]
+    tone: Option<crate::tone::Tone>,
     tiles: Vec<[i32; 2]>,
 }
 
@@ -94,6 +97,7 @@ pub fn save(doc: &Document) -> Vec<u8> {
             blend: l.blend.name().into(),
             clip: l.clip,
             vector: l.vector.is_some(),
+            tone: l.tone.clone(),
             tiles: keys.iter().map(|k| [k.tx, k.ty]).collect(),
         });
         for k in keys {
@@ -133,6 +137,7 @@ pub fn load(bytes: &[u8], history_limit_bytes: usize) -> Result<Document, String
             .ok_or_else(|| format!("レイヤー id {} が重複", lj.id))?;
         layer.blend = crate::blend::BlendMode::parse(&lj.blend).unwrap_or_default();
         layer.clip = lj.clip;
+        layer.tone = lj.tone.clone();
         if lj.vector {
             let strokes: Vec<crate::vector::VStroke> = match r.read(&vector_path(lj.id)) {
                 Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("vectors/{}.json: {e}", lj.id))?,

@@ -1,7 +1,7 @@
 // パネルの中身: ブラシ、レイヤー、カラー、アクション。輪のメニューもここで組む。
 import { attachRadialButton, openRadial, type RadialItem, type RadialMenu } from "@imagine/ring";
 import type { Bridge } from "../bridge";
-import { ADJUST_IDENTITY, isAdjustIdentity, type AdjustParams, type BrushJson, type BrushPreset, type LayerInfo } from "../protocol";
+import { ADJUST_IDENTITY, DEFAULT_TONE, isAdjustIdentity, type AdjustParams, type BrushJson, type BrushPreset, type LayerInfo, type ToneParams } from "../protocol";
 import type { AppState } from "../state";
 import { NO_RULER, RULER_LABELS, type Ruler } from "../ruler";
 import { ColorPicker, DEFAULT_PALETTE, hexToRgb, rgbToHex, type Rgb } from "./color";
@@ -380,10 +380,25 @@ export function renderSelectPanel(body: HTMLElement, ctx: Ctx): void {
 export function renderFillPanel(body: HTMLElement, ctx: Ctx): void {
   const { state, act } = ctx;
   act.setTool("fill");
-  body.append(el.title("塗りつぶし(バケツ)"));
+  body.append(el.title("塗りつぶし"));
+  body.append(
+    el.row(
+      el.button("タップで塗る", () => {
+        state.fillTool = "tap";
+        ctx.shell.rerender();
+      }, "grid", state.fillTool === "tap" ? "on" : ""),
+      el.button("囲って塗る(ベタ)", () => {
+        state.fillTool = "enclose";
+        ctx.shell.rerender();
+      }, "pen", state.fillTool === "enclose" ? "on" : "")
+    )
+  );
   const help = document.createElement("div");
   help.className = "phelp";
-  help.textContent = "キャンバスをタップした所から、似た色の範囲を今の色で塗ります。選択範囲があればその中だけ。";
+  help.textContent =
+    state.fillTool === "tap"
+      ? "キャンバスをタップした所から、似た色の範囲を今の色で塗ります。選択範囲があればその中だけ。"
+      : "塗りたい所をぐるっと囲むと、その中の空いている所(線や絵の具が無い所)だけを今の色で塗ります。線をまたいで囲んでも線の向こうは塗れません。";
   body.append(help);
   body.append(
     el.slider("許容値", 0, 255, 1, state.tolerance, (v) => {
@@ -664,6 +679,7 @@ export function renderLayersPanel(body: HTMLElement, ctx: Ctx): void {
         bridge.send({ type: "setLayerOpacity", id: cur.id, opacity: v / 100 });
       })
     );
+    if (cur.a8) renderToneSection(body, ctx, cur);
     if (cur.vector) {
       body.append(el.title("線幅(このレイヤーの線すべて)"));
       body.append(
@@ -685,6 +701,45 @@ export function renderLayersPanel(body: HTMLElement, ctx: Ctx): void {
     }
   }
   act.thumbnails();
+}
+
+/** トーン(モノクロレイヤーに非破壊で乗せる網点化)。 */
+function renderToneSection(body: HTMLElement, ctx: Ctx, l: LayerInfo): void {
+  const { bridge } = ctx;
+  body.append(el.title("トーン(網点化)"));
+  const set = (t: ToneParams | null) => bridge.send({ type: "setLayerTone", id: l.id, tone: t });
+  body.append(
+    el.toggle("このレイヤーをトーンにする(塗った所が網点になる)", l.tone !== null, (v) => set(v ? { ...DEFAULT_TONE } : null))
+  );
+  const t = l.tone;
+  if (!t) return;
+  body.append(
+    el.slider("線数", 10, 120, 5, t.lines, (v, final) => {
+      if (final) set({ ...t, lines: v });
+    }),
+    el.slider("濃度 %", 0, 100, 5, Math.round(t.density * 100), (v, final) => {
+      if (final) set({ ...t, density: v / 100 });
+    }),
+    el.slider("角度", 0, 90, 5, t.angle, (v, final) => {
+      if (final) set({ ...t, angle: v });
+    }),
+    el.slider("原稿の dpi", 72, 1200, 1, t.dpi, (v, final) => {
+      if (final) set({ ...t, dpi: v });
+    })
+  );
+  const shapes = el.row();
+  for (const [n, label] of [
+    [0, "網点"],
+    [1, "線"],
+    [2, "砂目"],
+  ] as const) {
+    shapes.append(el.button(label, () => set({ ...t, shape: n }), undefined, t.shape === n ? "on" : ""));
+  }
+  body.append(shapes);
+  const help = document.createElement("div");
+  help.className = "phelp";
+  help.textContent = "表示は縮小するとモアレを避けて灰色になります。書き出しは原稿の解像度で網点になります。";
+  body.append(help);
 }
 
 /** 合成モードの表示名(Photoshop / CLIP STUDIO の呼び方)。 */
