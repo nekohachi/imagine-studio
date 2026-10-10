@@ -11,6 +11,7 @@ import {
   DAB_STRIDE,
   POINT_STRIDE,
   type BrushPreset,
+  type FrameInfo,
   type FromWorker,
   type ToneParams,
   type LayerInfo,
@@ -60,8 +61,12 @@ function activeIsVector(): boolean {
   return doc ? doc.layer_vector(active) : false;
 }
 
-/** 画素だけを変える操作はベクターレイヤーでは線とずれるので断る。 */
+/** 画素だけを変える操作は、ベクターやコマ枠(画素が派生物)のレイヤーでは断る。 */
 function refuseOnVector(what: string): boolean {
+  if (activeIsFrame()) {
+    post({ type: "toast", message: `${what}はコマ枠レイヤーでは使えません(絵は別のレイヤーに)` });
+    return true;
+  }
   if (!activeIsVector()) return false;
   post({ type: "toast", message: `${what}はベクターレイヤーでは使えません(レイヤーパネルの「ラスタライズ」で画素にすると使えます)` });
   return true;
@@ -113,7 +118,27 @@ function layerInfos(): LayerInfo[] {
     clip: doc!.layer_clip(id),
     vector: doc!.layer_vector(id),
     tone: parseTone(doc!.layer_tone(id)),
+    frame: parseFrame(doc!.layer_frame(id)),
   }));
+}
+
+function parseFrame(json: string): FrameInfo | null {
+  if (!json) return null;
+  try {
+    const f = JSON.parse(json) as { border: number; gutter_h: number; gutter_v: number; fill_gutter: boolean; panels: unknown[] };
+    return { border: f.border, gutterH: f.gutter_h, gutterV: f.gutter_v, fillGutter: f.fill_gutter, panels: f.panels.length };
+  } catch {
+    return null;
+  }
+}
+
+function activeIsFrame(): boolean {
+  return doc ? doc.layer_frame(active) !== "" : false;
+}
+
+/** 基本枠の余白(紙の短辺の 5%)。 */
+function frameMargin(): number {
+  return doc ? Math.round(Math.min(doc.width, doc.height) * 0.05) : 0;
 }
 
 function parseTone(json: string): ToneParams | null {
@@ -464,7 +489,8 @@ async function handle(m: ToWorker): Promise<void> {
       }
       lastStrokeDabs = strokes[0]!.dab_count;
       freeStrokes();
-      if (activeIsVector()) bakeVector();
+      if (activeIsFrame()) post({ type: "toast", message: "コマ枠レイヤーには描けません。絵は別のレイヤーに描いてください" });
+      else if (activeIsVector()) bakeVector();
       else bake();
       strokePts = [];
       bbox = null;
@@ -493,7 +519,7 @@ async function handle(m: ToWorker): Promise<void> {
     }
     case "addLayer": {
       if (!doc) return;
-      active = m.vector ? doc.add_vector_layer(m.a8, m.name) : doc.add_layer(m.a8, m.name);
+      active = m.frame ? doc.add_frame_layer(m.name, frameMargin()) : m.vector ? doc.add_vector_layer(m.a8, m.name) : doc.add_layer(m.a8, m.name);
       uploadActiveAll();
       rebuildMerged();
       present();
@@ -529,6 +555,8 @@ async function handle(m: ToWorker): Promise<void> {
         present();
         scheduleAutosave();
       }
+      // 線やコマの数も戻るので、レイヤー情報も送り直す
+      post({ type: "layers", layers: layerInfos(), active });
       post({ type: "stats", stats: stats(performance.now(), 0, 0) });
       return;
     }
@@ -812,6 +840,26 @@ async function handle(m: ToWorker): Promise<void> {
     case "ruler":
       ruler = m.ruler;
       return;
+    case "frameSplit":
+    case "frameRemove":
+    case "frameSet":
+    case "frameReset": {
+      if (!doc || !activeIsFrame()) return;
+      const t0 = performance.now();
+      let changed: Int32Array;
+      if (m.type === "frameSplit") changed = doc.frame_split(active, m.x0, m.y0, m.x1, m.y1);
+      else if (m.type === "frameRemove") changed = doc.frame_remove(active, m.x, m.y);
+      else if (m.type === "frameSet") changed = doc.frame_set(active, m.border, m.gutterH, m.gutterV, m.fillGutter);
+      else changed = doc.frame_reset(active, m.margin);
+      if (!changed.length && m.type === "frameSplit") post({ type: "toast", message: "そこにコマがありません(コマの中で割ってください)" });
+      uploadActiveTiles(changed);
+      lastBakeMs = performance.now() - t0;
+      present();
+      scheduleAutosave();
+      post({ type: "layers", layers: layerInfos(), active });
+      post({ type: "stats", stats: stats(t0, 0, 0) });
+      return;
+    }
     case "vectorWidth":
     case "vectorUniform": {
       if (!doc || !activeIsVector()) return;

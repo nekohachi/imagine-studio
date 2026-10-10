@@ -257,6 +257,7 @@ state.on("tool", () => {
   shell.buttons.brush!.classList.toggle("on", state.tool === "brush" && !state.brush.eraser);
   shell.buttons.eraser!.classList.toggle("on", state.tool === "brush" && Boolean(state.brush.eraser));
   if (state.tool === "fill") shell.toast("塗りつぶし: キャンバスをタップ");
+  if (state.tool === "frame") shell.toast("コマ割り: 縦 / 横はコマをタップ、斜めはドラッグ、消すはタップ");
 });
 
 let eyedropId = 0;
@@ -279,6 +280,23 @@ const input = new CanvasInput(canvas, state, bridge, mods, {
     });
   },
   onRulerTap: (x, y) => rulerTap(ctx, x, y),
+  onFrameGesture: (x0, y0, x1, y1) => {
+    switch (state.frameMode) {
+      case "v":
+        bridge.send({ type: "frameSplit", x0, y0, x1: x0, y1: y0 + 100 });
+        break;
+      case "h":
+        bridge.send({ type: "frameSplit", x0, y0, x1: x0 + 100, y1: y0 });
+        break;
+      case "diag":
+        if (Math.hypot(x1 - x0, y1 - y0) < 4) shell.toast("斜めに割るときは、コマの中でドラッグしてください");
+        else bridge.send({ type: "frameSplit", x0, y0, x1, y1 });
+        break;
+      case "remove":
+        bridge.send({ type: "frameRemove", x: x0, y: y0 });
+        break;
+    }
+  },
   closePanels: () => {
     if (!shell.panelOpen()) return false;
     // 選択と塗りのパネルは開いたまま使う(タップが操作なので)

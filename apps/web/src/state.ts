@@ -75,7 +75,9 @@ export class AppState {
   eyedropOnce = false;
   uiHidden = false;
   /** 今のツール。brush 以外はキャンバスのタップが描画にならない */
-  tool: "brush" | "select" | "fill" | "transform" | "ruler" = "brush";
+  tool: "brush" | "select" | "fill" | "transform" | "ruler" | "frame" = "brush";
+  /** コマ割りツールの動作 */
+  frameMode: "v" | "h" | "diag" | "remove" = "v";
   /** 定規ツールで次のタップが置く点の番号(直線の A/B、パースの消失点) */
   rulerTap = 0;
   /** 平行線定規の向きを 2 タップで決めるときの 1 点目 */

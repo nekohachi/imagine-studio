@@ -59,6 +59,15 @@ export interface ToneParams {
 
 export const DEFAULT_TONE: ToneParams = { lines: 60, dpi: 600, density: 0.5, angle: 45, shape: 0 };
 
+/** コマ枠レイヤーの設定(コマの頂点はワーカーが持つ) */
+export interface FrameInfo {
+  border: number;
+  gutterH: number;
+  gutterV: number;
+  fillGutter: boolean;
+  panels: number;
+}
+
 export interface LayerInfo {
   id: number;
   name: string;
@@ -72,6 +81,8 @@ export interface LayerInfo {
   vector: boolean;
   /** トーン(A8 レイヤーだけ)。無ければ null */
   tone: ToneParams | null;
+  /** コマ枠レイヤーなら設定。無ければ null */
+  frame: FrameInfo | null;
 }
 
 /** 色調補正のパラメータ(canvas-core の Adjust と同じ形。省いた項目は「変化なし」)。 */
@@ -123,7 +134,11 @@ export type ToWorker =
   | { type: "end" }
   | { type: "cancel" }
   | { type: "setLayer"; id: number }
-  | { type: "addLayer"; a8: boolean; name: string; vector?: boolean }
+  | { type: "addLayer"; a8: boolean; name: string; vector?: boolean; frame?: boolean }
+  | { type: "frameSplit"; x0: number; y0: number; x1: number; y1: number }
+  | { type: "frameRemove"; x: number; y: number }
+  | { type: "frameSet"; border: number; gutterH: number; gutterV: number; fillGutter: boolean }
+  | { type: "frameReset"; margin: number }
   | { type: "ruler"; ruler: import("./ruler").Ruler }
   | { type: "vectorWidth"; factor: number }
   | { type: "vectorUniform" }

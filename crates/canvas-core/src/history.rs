@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 
 use crate::cel::Snapshot;
 use crate::document::LayerId;
+use crate::frame::Frame;
 use crate::vector::VStroke;
 
 /// ベクターレイヤーの線の入れ替え: 今の `at..at+len` を `old` に差し替える。
@@ -23,6 +24,8 @@ pub struct Entry {
     pub tiles: Snapshot,
     /// ベクターレイヤーなら、線の入れ替え
     pub vector: Option<Splice>,
+    /// コマ枠レイヤーなら、もう片方のコマ枠
+    pub frame: Option<Frame>,
 }
 
 impl Entry {
@@ -36,10 +39,11 @@ impl Entry {
             .vector
             .as_ref()
             .map_or(0, |s| s.old.iter().map(|v| v.bytes()).sum::<usize>() + 32);
-        tiles + vec
+        let frame = self.frame.as_ref().map_or(0, |f| f.panels.iter().map(|p| p.pts.len() * 8 + 16).sum::<usize>() + 32);
+        tiles + vec + frame
     }
     pub fn is_empty(&self) -> bool {
-        self.tiles.is_empty() && self.vector.is_none()
+        self.tiles.is_empty() && self.vector.is_none() && self.frame.is_none()
     }
 }
 
@@ -145,6 +149,7 @@ mod tests {
                 .map(|i| (TileKey::new(i as i32, 0), Some(Tile::empty(PixelFormat::A8))))
                 .collect(),
             vector: None,
+            frame: None,
         }
     }
 

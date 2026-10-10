@@ -33,6 +33,8 @@ export interface CanvasInputHooks {
   onEyedrop: (docX: number, docY: number) => void;
   /** 定規ツールのタップ(doc) */
   onRulerTap: (docX: number, docY: number) => void;
+  /** コマ割りツール: 押した点と離した点(doc) */
+  onFrameGesture: (x0: number, y0: number, x1: number, y1: number) => void;
   /** 描き始めにパネルを閉じる。閉じたなら真(そのタップは描かない) */
   closePanels: () => boolean;
   /** 選択の矩形や投げ縄を仮表示する SVG(画面座標、CSS px) */
@@ -89,6 +91,8 @@ export class CanvasInput {
   } | null = null;
   /** 2 本指での拡縮・回転の開始時の行列 */
   private gestureBase: Affine | null = null;
+  /** コマ割りのドラッグ: 始点(doc) */
+  private framing: { id: number; x0: number; y0: number } | null = null;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -479,6 +483,14 @@ export class CanvasInput {
         return;
       }
 
+      // コマ割り: 押した所と離した所
+      if (this.state.tool === "frame") {
+        const [x, y] = this.toDoc(e);
+        this.framing = { id: e.pointerId, x0: x, y0: y };
+        c.setPointerCapture(e.pointerId);
+        return;
+      }
+
       // 定規: タップで点を置く
       if (this.state.tool === "ruler") {
         const [x, y] = this.toDoc(e);
@@ -665,6 +677,20 @@ export class CanvasInput {
 
     const finish = (e: PointerEvent, cancel: boolean) => {
       this.longPress.end(e.pointerId);
+      if (this.framing && e.pointerId === this.framing.id) {
+        const f = this.framing;
+        this.framing = null;
+        if (!cancel) {
+          const [x, y] = this.toDoc(e);
+          this.hooks.onFrameGesture(f.x0, f.y0, x, y);
+        }
+        try {
+          c.releasePointerCapture(e.pointerId);
+        } catch {
+          /* 既に外れている */
+        }
+        return;
+      }
       if (this.dragging && e.pointerId === this.dragging.id) {
         this.dragging = null;
         try {

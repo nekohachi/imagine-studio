@@ -145,6 +145,61 @@ impl Doc {
         keys_to_array(&self.inner.fill_enclosed(layer, reference, &pts, threshold, [r, g, b, 255]))
     }
 
+    /// 一番上にコマ枠レイヤーを足す(基本枠 1 コマ、紙の端から margin px)。
+    pub fn add_frame_layer(&mut self, name: &str, margin: f32) -> u32 {
+        self.inner.add_frame_layer(name, margin)
+    }
+
+    /// コマ枠の JSON(無ければ空文字)。
+    pub fn layer_frame(&self, id: u32) -> String {
+        self.inner
+            .frame_of(id)
+            .map_or(String::new(), |f| serde_json::to_string(f).unwrap_or_default())
+    }
+
+    /// 点 (x0, y0) を含むコマを (x0, y0)–(x1, y1) の直線で割る。変わったタイル(割れなければ長さ 0)。
+    pub fn frame_split(&mut self, layer: u32, x0: f32, y0: f32, x1: f32, y1: f32) -> js_sys::Int32Array {
+        match self.inner.frame_edit(layer, "コマ割り", |f| f.split(x0, y0, x1, y1)) {
+            Some(keys) => keys_to_array(&keys),
+            None => js_sys::Int32Array::new_with_length(0),
+        }
+    }
+
+    /// 点を含むコマを消す。
+    pub fn frame_remove(&mut self, layer: u32, x: f32, y: f32) -> js_sys::Int32Array {
+        match self.inner.frame_edit(layer, "コマを消す", |f| f.remove_at(x, y)) {
+            Some(keys) => keys_to_array(&keys),
+            None => js_sys::Int32Array::new_with_length(0),
+        }
+    }
+
+    /// 枠線の太さ、隙間、外の白を変える。
+    pub fn frame_set(&mut self, layer: u32, border: f32, gutter_h: f32, gutter_v: f32, fill_gutter: bool) -> js_sys::Int32Array {
+        match self.inner.frame_edit(layer, "コマ枠の設定", |f| {
+            f.border = border.clamp(0.0, 200.0);
+            f.gutter_h = gutter_h.clamp(0.0, 500.0);
+            f.gutter_v = gutter_v.clamp(0.0, 500.0);
+            f.fill_gutter = fill_gutter;
+            true
+        }) {
+            Some(keys) => keys_to_array(&keys),
+            None => js_sys::Int32Array::new_with_length(0),
+        }
+    }
+
+    /// 基本枠 1 コマに戻す。
+    pub fn frame_reset(&mut self, layer: u32, margin: f32) -> js_sys::Int32Array {
+        let (w, h) = (self.inner.width(), self.inner.height());
+        match self.inner.frame_edit(layer, "コマ枠を戻す", |f| {
+            let page = canvas_core::Frame::page(w, h, margin);
+            f.panels = page.panels;
+            true
+        }) {
+            Some(keys) => keys_to_array(&keys),
+            None => js_sys::Int32Array::new_with_length(0),
+        }
+    }
+
     pub fn rasterize_layer(&mut self, id: u32) -> bool {
         self.inner.rasterize_layer(id)
     }

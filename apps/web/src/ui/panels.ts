@@ -28,7 +28,7 @@ export interface Ctx {
     exportPng: () => void;
     eyedropOnce: () => void;
     thumbnails: () => void;
-    setTool: (tool: "brush" | "select" | "fill" | "transform" | "ruler") => void;
+    setTool: (tool: "brush" | "select" | "fill" | "transform" | "ruler" | "frame") => void;
     /** 定規を置き換えて、ワーカーと表示に反映する */
     setRuler: (r: Ruler) => void;
     /** 変形: 持ち上げる / 置く / 戻す / 反転や回転 */
@@ -618,6 +618,7 @@ export function renderLayersPanel(body: HTMLElement, ctx: Ctx): void {
     addBtn,
     () => ({
       N: { label: "ラスター", sub: "カラー", icon: ICONS.layers, run: addRaster },
+      NE: { label: "コマ枠", sub: "漫画のコマ割り", icon: ICONS.grid, run: () => bridge.send({ type: "addLayer", a8: false, frame: true, name: `コマ枠 ${n}` }) },
       E: { label: "モノクロ", sub: "A8・線画やトーン", icon: ICONS.layers, run: () => bridge.send({ type: "addLayer", a8: true, name: `モノクロ ${n}` }) },
       S: { label: "ベクター", sub: "線を後から消せる", icon: ICONS.pen, run: () => bridge.send({ type: "addLayer", a8: false, vector: true, name: `線 ${n}` }) },
       W: {
@@ -650,7 +651,7 @@ export function renderLayersPanel(body: HTMLElement, ctx: Ctx): void {
     name.className = "lyname";
     const modeName = BLEND_LABELS[state.blendNames[l.blend] ?? "normal"] ?? state.blendNames[l.blend];
     name.innerHTML =
-      `<span>${l.clip ? "↳ " : ""}${l.name}${l.vector ? "(ベクター)" : ""}${l.a8 ? "(モノクロ)" : ""}</span>` +
+      `<span>${l.clip ? "↳ " : ""}${l.name}${l.vector ? "(ベクター)" : ""}${l.frame ? "(コマ枠)" : ""}${l.a8 ? "(モノクロ)" : ""}</span>` +
       `<span class="lysub">${l.blend ? modeName : ""}${l.opacity < 1 ? ` ${Math.round(l.opacity * 100)}%` : ""}</span>`;
     const eye = document.createElement("button");
     eye.className = "lyeye";
@@ -680,6 +681,7 @@ export function renderLayersPanel(body: HTMLElement, ctx: Ctx): void {
       })
     );
     if (cur.a8) renderToneSection(body, ctx, cur);
+    if (cur.frame) renderFrameSection(body, ctx, cur);
     if (cur.vector) {
       body.append(el.title("線幅(このレイヤーの線すべて)"));
       body.append(
@@ -701,6 +703,60 @@ export function renderLayersPanel(body: HTMLElement, ctx: Ctx): void {
     }
   }
   act.thumbnails();
+}
+
+/** コマ枠レイヤーの設定とコマ割りツール。 */
+function renderFrameSection(body: HTMLElement, ctx: Ctx, l: LayerInfo): void {
+  const { bridge, state, act } = ctx;
+  const f = l.frame!;
+  body.append(el.title(`コマ割り(${f.panels} コマ)`));
+  const modes = el.row();
+  for (const [mode, label, sub] of [
+    ["v", "縦に割る", "コマをタップ"],
+    ["h", "横に割る", "コマをタップ"],
+    ["diag", "斜めに割る", "コマの中をドラッグ"],
+    ["remove", "コマを消す", "コマをタップ"],
+  ] as const) {
+    const b = el.button(label, () => {
+      state.frameMode = mode;
+      act.setTool("frame");
+      ctx.shell.rerender();
+    }, undefined, state.tool === "frame" && state.frameMode === mode ? "on" : "");
+    b.title = sub;
+    modes.append(b);
+  }
+  body.append(modes);
+  const help = document.createElement("div");
+  help.className = "phelp";
+  help.textContent = "縦 / 横はコマをタップした所で割れます。斜めはコマの中でドラッグした向きに割れます。絵は別のレイヤーに描き、このレイヤーを上に置くとコマの外が白で隠れます。";
+  body.append(help);
+  const set = (patch: Partial<typeof f>) => {
+    const n = { ...f, ...patch };
+    bridge.send({ type: "frameSet", border: n.border, gutterH: n.gutterH, gutterV: n.gutterV, fillGutter: n.fillGutter });
+  };
+  body.append(
+    el.slider("枠線の太さ px", 0, 40, 1, Math.round(f.border), (v, final) => {
+      if (final) set({ border: v });
+    }),
+    el.slider("コマ間(左右)px", 0, 200, 2, Math.round(f.gutterH), (v, final) => {
+      if (final) set({ gutterH: v });
+    }),
+    el.slider("コマ間(天地)px", 0, 200, 2, Math.round(f.gutterV), (v, final) => {
+      if (final) set({ gutterV: v });
+    }),
+    el.toggle("コマの外を白で埋める", f.fillGutter, (v) => set({ fillGutter: v }))
+  );
+  body.append(
+    el.row(
+      el.button("基本枠に戻す(1 コマ)", () => {
+        if (window.confirm("コマ割りを 1 コマに戻しますか?(戻せます)")) bridge.send({ type: "frameReset", margin: Math.round(Math.min(state.docW, state.docH) * 0.05) });
+      }, "clear"),
+      el.button("ブラシへ", () => {
+        act.setTool("brush");
+        ctx.shell.closePanel();
+      }, "brush")
+    )
+  );
 }
 
 /** トーン(モノクロレイヤーに非破壊で乗せる網点化)。 */

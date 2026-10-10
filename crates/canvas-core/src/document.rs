@@ -4,6 +4,7 @@
 use crate::adjust::{gaussian_blur, unsharp, Adjust};
 use crate::blend::{composite_pixel, BlendMode};
 use crate::cel::{Blend, Cel, Snapshot};
+use crate::frame::Frame;
 use crate::history::{Entry, History, Splice};
 use crate::selection::{region_by_color, Mask, SelectMode};
 use crate::tile::{PixelFormat, Rect, TileKey};
@@ -36,6 +37,8 @@ pub struct Layer {
     pub vector: Option<Vec<VStroke>>,
     /// トーン(A8 レイヤーに非破壊で乗せる網点化)
     pub tone: Option<Tone>,
+    /// コマ枠レイヤーならコマの列(cel はその描画キャッシュ)
+    pub frame: Option<Frame>,
 }
 
 impl Layer {
@@ -50,6 +53,7 @@ impl Layer {
             cel: Cel::new(format, width, height),
             vector: None,
             tone: None,
+            frame: None,
         }
     }
 
@@ -356,6 +360,14 @@ impl Document {
                     s.translate(dx as f32, dy as f32);
                 }
             }
+            if let Some(f) = l.frame.as_mut() {
+                for p in &mut f.panels {
+                    for q in &mut p.pts {
+                        q[0] += dx as f32;
+                        q[1] += dy as f32;
+                    }
+                }
+            }
         }
         self.width = w;
         self.height = h;
@@ -390,6 +402,17 @@ impl Document {
                 for s in v.iter_mut() {
                     s.scale(m.a, m.d);
                 }
+            }
+            if let Some(f) = l.frame.as_mut() {
+                for p in &mut f.panels {
+                    for q in &mut p.pts {
+                        q[0] *= m.a;
+                        q[1] *= m.d;
+                    }
+                }
+                f.border *= (m.a + m.d) * 0.5;
+                f.gutter_h *= m.a;
+                f.gutter_v *= m.d;
             }
         }
         self.width = w;
@@ -618,6 +641,7 @@ impl Document {
             cel,
             vector: src.vector.clone(),
             tone: src.tone.clone(),
+            frame: src.frame.clone(),
         };
         self.layers.insert(i + 1, layer);
         Some(new_id)
@@ -698,6 +722,7 @@ impl Document {
                 layer: lower_id,
                 tiles: snap,
                 vector: None,
+                frame: None,
             });
             all_changed.extend(keys);
         }
@@ -723,6 +748,7 @@ impl Document {
             layer,
             tiles: snap,
             vector: None,
+            frame: None,
         });
         keys
     }
@@ -771,6 +797,7 @@ impl Document {
             layer,
             tiles: snap,
             vector: Some(Splice { at, len: 1, old: Vec::new() }),
+            frame: None,
         });
         keys
     }
@@ -800,6 +827,7 @@ impl Document {
             layer,
             tiles: snap,
             vector: Some(Splice { at, len: n, old: Vec::new() }),
+            frame: None,
         });
         keys
     }
@@ -863,6 +891,7 @@ impl Document {
                 len: r.replaced.len(),
                 old,
             }),
+            frame: None,
         });
         Some(keys)
     }
@@ -893,6 +922,7 @@ impl Document {
             layer,
             tiles: snap,
             vector: Some(Splice { at: 0, len: n, old }),
+            frame: None,
         });
         keys
     }
@@ -925,14 +955,66 @@ impl Document {
             len: 0,
             old: std::mem::take(v),
         });
+        // コマ枠ならコマも消す
+        let frame = l.frame.as_mut().map(|f| {
+            let old = f.clone();
+            f.panels.clear();
+            old
+        });
         let keys: Vec<_> = snap.iter().map(|(k, _)| *k).collect();
         self.history.push(Entry {
             label: "消去".into(),
             layer,
             tiles: snap,
             vector,
+            frame,
         });
         keys
+    }
+
+    // ---- コマ枠レイヤー ----
+
+    /// 一番上にコマ枠レイヤーを足す(基本枠 1 コマ)。
+    pub fn add_frame_layer(&mut self, name: &str, margin: f32) -> LayerId {
+        let id = self.add_layer(PixelFormat::Rgba8, name);
+        let f = Frame::page(self.width, self.height, margin);
+        let (w, h) = (self.width, self.height);
+        if let Some(l) = self.layer_mut(id) {
+            let px = f.render(w, h);
+            l.cel.write_rect(Rect::new(0, 0, w as i32, h as i32), &px);
+            l.cel.take_dirty();
+            l.frame = Some(f);
+        }
+        id
+    }
+
+    pub fn frame_of(&self, layer: LayerId) -> Option<&Frame> {
+        self.layer(layer)?.frame.as_ref()
+    }
+
+    /// コマ枠を書き換えて描き直す。`edit` が偽を返したら何もしない。
+    pub fn frame_edit<E>(&mut self, layer: LayerId, label: &str, edit: E) -> Option<Vec<TileKey>>
+    where
+        E: FnOnce(&mut Frame) -> bool,
+    {
+        let (w, h) = (self.width, self.height);
+        let l = self.layer_mut(layer)?;
+        let f = l.frame.as_mut()?;
+        let old = f.clone();
+        if !edit(f) {
+            return None;
+        }
+        let px = f.render(w, h);
+        let snap = l.cel.write_rect(Rect::new(0, 0, w as i32, h as i32), &px);
+        let keys: Vec<_> = snap.iter().map(|(k, _)| *k).collect();
+        self.history.push(Entry {
+            label: label.to_string(),
+            layer,
+            tiles: snap,
+            vector: None,
+            frame: Some(old),
+        });
+        Some(keys)
     }
 
     /// ベクターレイヤーをラスターにする(線を捨てて画素だけ残す)。履歴は捨てる。
@@ -965,6 +1047,9 @@ impl Document {
                 let n = sp.old.len();
                 let removed: Vec<VStroke> = v.splice(at..end, sp.old).collect();
                 e.vector = Some(Splice { at, len: n, old: removed });
+            }
+            if let (Some(f), Some(cur)) = (e.frame.take(), l.frame.as_mut()) {
+                e.frame = Some(std::mem::replace(cur, f));
             }
         }
         (e, changed)
